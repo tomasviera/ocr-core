@@ -1,0 +1,32 @@
+# ocr-core — .gitignore
+# Regla dura: NINGÚN secreto va a GitHub (aunque el repo sea privado).
+# El core no contiene secretos por diseño: los motores no leen secrets,
+# y database.php (Fase 4) se parametriza por el secrets.php de cada proyecto.
+secrets*
+*.secret
+*.secrets
+.env
+.env.*
+
+# Efímeros / generados (no pertenecen al core)
+temp/
+tmp/
+*.log
+__pycache__/
+*.pyc
+*.pyo
+
+# El core NUNCA se vendoriza a sí mismo
+core_vendor/
+core_vendor.prev/
+core_version.txt
+
+# Backups que deja el script de vendoring en proyectos consumidores
+*.prev/
+
+# Sistema operativo / editores
+Thumbs.db
+.DS_Store
+*~
+.vscode/
+.idea/
