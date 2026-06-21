@@ -76,6 +76,7 @@ ejecutarAgy(
 | `home_dir` | string | no | override de HOME (lee/escribe `~/.gemini` de acá) |
 | `modelo_agy` | string | no | modelo exacto para `settings.json["model"]` |
 | `debug_dir` | string | no | si está, vuelca bundle forense (gateado por flag) |
+| `workdir_base` | string | no | base del workdir efímero del wrapper; si falta cae a `$resultadosDir` y luego a `sys_get_temp_dir()` (se cuelga `agy_subprocess/`) |
 | `timeout_respuesta_seg` | int | no | default = `$timeout` |
 | `cols` | int | no | columnas del pseudo-terminal (default 2000) |
 | `rows` | int | no | filas (default 100) |
