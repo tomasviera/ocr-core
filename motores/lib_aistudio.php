@@ -319,7 +319,8 @@ function _aistudioEjecutarUnIntento(
     ?string $screenshotErrorPath,
     int    $procTimeout,
     bool   $noCerrarTabError = false,
-    string $thinkingLevel = ''
+    string $thinkingLevel = '',
+    bool   $sinImagen = false
 ): array {
     $cmd = [
         $pythonBin, '-u', $scriptPath,
@@ -342,6 +343,9 @@ function _aistudioEjecutarUnIntento(
     }
     if ($noCerrarTabError) {
         $cmd[] = '--no-cerrar-tab-error';
+    }
+    if ($sinImagen) {
+        $cmd[] = '--sin-imagen';
     }
 
     $sandboxDir = dirname($salidaJsonPath);
@@ -450,7 +454,8 @@ function ejecutarAiStudio(
     string $resultadosDir,
     array  $aistudioConfig = [],
     int    $timeout = 300,
-    int    $maxIntentos = 1
+    int    $maxIntentos = 1,
+    bool   $sinImagen = false
 ): array {
     $t0Total = microtime(true);
     // CORE: la lib vive en core_vendor/motores/ — NO se deriva el root del
@@ -486,7 +491,7 @@ function ejecutarAiStudio(
         return _aistudioShapeError("script_no_encontrado: $scriptPath", $t0Total);
     }
 
-    if (!is_file($imagenPath)) {
+    if (!$sinImagen && !is_file($imagenPath)) {
         return _aistudioShapeError("imagen_no_existe: $imagenPath", $t0Total);
     }
 
@@ -515,7 +520,11 @@ function ejecutarAiStudio(
     // process_page.php como procesarJobRenderYEncolar). Si el path termina en
     // .b64 lo decodificamos directo al sandbox; si es una imagen real, se copia.
     // (Mismo contrato que ejecutarGeminiCLI(), que también decodifica .b64.)
-    if (strtolower(substr($imagenPath, -4)) === '.b64') {
+    if ($sinImagen) {
+        // Postproceso (v2): modo sin imagen real. No se materializa image.jpg en
+        // el sandbox; el .py recibe --sin-imagen y no adjunta nada (AI Studio web
+        // no puede mandar una dummy sin que se vea, a diferencia de agy).
+    } elseif (strtolower(substr($imagenPath, -4)) === '.b64') {
         $b64Data = @file_get_contents($imagenPath);
         if ($b64Data === false) {
             aistudioBorrarSandbox($sandboxDir);
@@ -556,13 +565,15 @@ function ejecutarAiStudio(
     //    reintentar (cross-cuenta) / error. Ver BITACORA 2026-06-03.
     $intentos = 1;
     coreLog('aistudio_web', 'INFO',
-        "Enviando imagen al modelo (AI Studio web). Espera ~60–90s mientras carga UI, sube imagen y el modelo responde.",
-        ['imagen' => basename($imagenPath), 'modelo' => $modelo, 'intento' => $intentos]);
+        $sinImagen
+            ? "Enviando prompt al modelo (AI Studio web, sin imagen). Espera ~60–90s mientras carga UI y el modelo responde."
+            : "Enviando imagen al modelo (AI Studio web). Espera ~60–90s mientras carga UI, sube imagen y el modelo responde.",
+        ['imagen' => $sinImagen ? '(sin imagen)' : basename($imagenPath), 'modelo' => $modelo, 'intento' => $intentos]);
 
     $resp = _aistudioEjecutarUnIntento(
         $pythonBin, $scriptPath, $imagenSandbox, $promptSandbox, $salidaJsonPath,
         $cdpUrl, $modelo, $tResp, $mediaRes, $screenshotErrorPath, $procTimeout,
-        $noCerrarTab, $thinking
+        $noCerrarTab, $thinking, $sinImagen
     );
 
     $data      = $resp['data'] ?? [];

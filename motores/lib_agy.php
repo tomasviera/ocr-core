@@ -354,7 +354,8 @@ function ejecutarAgy(
     string $resultadosDir,
     array  $agyConfig = [],
     int    $timeout = 300,
-    int    $maxIntentos = 1
+    int    $maxIntentos = 1,
+    bool   $sinImagen = false
 ): array {
     $t0Total = microtime(true);
 
@@ -385,7 +386,11 @@ function ejecutarAgy(
         return _agyShapeError("script_no_encontrado: $scriptPath", $t0Total);
     }
 
-    if (!is_file($imagenPath)) {
+    // Postproceso (v2): modo sin imagen real. agy igual necesita un image.jpg
+    // copiable en su sandbox aunque el prompt no lo referencie → el motor crea
+    // una dummy 1×1 en el workdir (antes esto vivía en el caller de v2). El .py
+    // no cambia: recibe una imagen real (mínima).
+    if (!$sinImagen && !is_file($imagenPath)) {
         return _agyShapeError("imagen_no_existe: $imagenPath", $t0Total);
     }
 
@@ -419,6 +424,16 @@ function ejecutarAgy(
         return _agyShapeError("workdir_no_se_pudo_crear: $workdir", $t0Total);
     }
 
+    // Modo sin imagen: materializar la dummy 1×1 dentro del workdir efímero y
+    // apuntar $imagenPath a ella. Así el resto del flujo (y el .py) es idéntico.
+    if ($sinImagen) {
+        $imagenPath = $workdir . DIRECTORY_SEPARATOR . '_dummy.jpg';
+        if (@file_put_contents($imagenPath, _agyDummyJpgBytes()) === false) {
+            agyBorrarWorkdir($workdir);
+            return _agyShapeError("dummy_jpg_escritura_fallo: $imagenPath", $t0Total);
+        }
+    }
+
     // El .py recibe el prompt como ruta y lo copia al sandbox por sí mismo
     // (preparar_sandbox() → sandbox_dir/prompt.md). Lo escribimos a workdir/.
     $promptPath     = $workdir . DIRECTORY_SEPARATOR . 'prompt.md';
@@ -442,8 +457,10 @@ function ejecutarAgy(
     //    (ver lib_aistudio.php:545-553 y BITACORA 2026-06-03). ──
     $intentos = 1;
     coreLog('agy', 'INFO',
-        "Enviando imagen a agy (Antigravity CLI). Espera ~40–90s mientras agy procesa.",
-        ['imagen' => basename($imagenPath), 'modelo' => $modeloAgy ?? '(global)', 'intento' => $intentos]);
+        $sinImagen
+            ? "Enviando prompt a agy (Antigravity CLI, sin imagen). Espera ~40–90s mientras agy procesa."
+            : "Enviando imagen a agy (Antigravity CLI). Espera ~40–90s mientras agy procesa.",
+        ['imagen' => $sinImagen ? '(sin imagen)' : basename($imagenPath), 'modelo' => $modeloAgy ?? '(global)', 'intento' => $intentos]);
 
     $resp = _agyEjecutarUnIntento(
         $pythonBin, $scriptPath,
@@ -465,6 +482,27 @@ function ejecutarAgy(
 
     return _agyShapeRespuesta($resp, $workdir, $intentos, $t0Total,
         conservarWorkdir: $conservar, cuotaAgotada: $cuota, erroresIntentos: []);
+}
+
+/**
+ * Bytes de un JPEG 1×1 (dummy). Lo usa el modo $sinImagen: agy exige un
+ * image.jpg copiable en su sandbox aunque el prompt no lo referencie (postproceso
+ * de v2). Antes vivía en el caller (lib_postprocesador::_postprocDummyJpg).
+ */
+function _agyDummyJpgBytes(): string
+{
+    return base64_decode(
+        '/9j/2wCEAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB' .
+        'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/2wBDAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB' .
+        'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wgARCAABAAEDASIA' .
+        'AhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAH/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/9oA' .
+        'DAMBAAIQAxAAAAEH/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQI//8QAFBEBAAAA' .
+        'AAAAAAAAAAAAAAAAAP/aAAgBAwEBPwE//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEB' .
+        'PwE//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwI//8QAFBABAAAAAAAAAAAAAAAA' .
+        'AAAAAP/aAAgBAQABPyE//9oADAMBAAIAAwAAABAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/a' .
+        'AAgBAwEBPxA//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxA//8QAFBABAAAAAAAA' .
+        'AAAAAAAAAAAAAP/aAAgBAQABPxA//9k='
+    );
 }
 
 // =====================================================================

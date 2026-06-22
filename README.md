@@ -186,6 +186,26 @@ ejecutarAiStudio(
 
 ---
 
+## Modo sin imagen — `$sinImagen` (param compartido, Fase 2)
+
+Ambos motores (`ejecutarAgy` / `ejecutarAiStudio`) aceptan un **9º parámetro
+opcional** `bool $sinImagen = false`. Sirve al **postproceso de v2** (llamados al
+motor con prompt de texto puro, sin imagen). Default `false` → prensa (sólo
+transcripción) no se entera; sus llamados de 8 args quedan idénticos.
+
+- `ejecutarAgy(..., $sinImagen: true)`: el motor materializa una **dummy 1×1** en
+  el workdir (agy exige un `image.jpg` copiable). El `.py` de agy **no cambia**.
+- `ejecutarAiStudio(..., $sinImagen: true)`: saltea la copia y pasa `--sin-imagen`
+  al `.py`, que **no adjunta** nada (AI Studio web no puede mandar una dummy sin
+  que se vea). `--imagen` pasa a opcional en el `.py`.
+
+El "cómo" del sin-imagen difiere por motor (inherente); el **contrato y la lógica
+del caller son idénticos** (un flag). Un proyecto que llame motores para
+transcripción *y* postproceso usa la misma función con `$sinImagen` distinto —
+en v2 vía el dispatcher único `ejecutarMotor()`.
+
+---
+
 ## Artefacto #2 — Costura logger (convención `function_exists`)
 
 El motor del core loguea llamando a una función de **nombre fijo**, protegida por

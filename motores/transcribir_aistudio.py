@@ -208,7 +208,9 @@ UMBRAL_LONGITUD_SOSPECHOSA = 1000
 
 def parse_args():
     p = argparse.ArgumentParser(description="Wrapper AI Studio via Playwright + CDP")
-    p.add_argument("--imagen", required=True, help="Ruta absoluta a la imagen a transcribir.")
+    p.add_argument("--imagen", required=False, default=None, help="Ruta absoluta a la imagen a transcribir.")
+    p.add_argument("--sin-imagen", action="store_true", dest="sin_imagen",
+                   help="Modo sin imagen: no sube ningún archivo (postprocesamiento de texto puro).")
     p.add_argument("--prompt", required=True, help="Ruta absoluta al archivo de prompt completo.")
     p.add_argument("--salida-json", required=True, dest="salida_json",
                    help="Ruta absoluta donde escribir el JSON con el resultado.")
@@ -1355,16 +1357,20 @@ async def ejecutar_flujo(page, imagen: Path, prompt_completo: str, args, t0: flo
         except Exception:
             pass
 
-    # Upload imagen
-    sys.stderr.write(f"[ais] subiendo imagen: {imagen.name} ({imagen.stat().st_size} bytes)\n")
-    file_set = False
-    try:
-        inputs = page.locator(SEL_FILE_INPUT)
-        if await inputs.count() > 0:
-            await inputs.first.set_input_files(str(imagen), timeout=8000)
-            file_set = True
-    except Exception:
-        pass
+    # Upload imagen (salvo modo sin-imagen: postproc de texto puro no adjunta nada)
+    sin_imagen = getattr(args, "sin_imagen", False) or imagen is None
+    file_set = sin_imagen  # True en sin-imagen => saltea también el fallback del file-chooser
+    if sin_imagen:
+        sys.stderr.write("[ais] modo sin-imagen: no se adjunta archivo\n")
+    else:
+        sys.stderr.write(f"[ais] subiendo imagen: {imagen.name} ({imagen.stat().st_size} bytes)\n")
+        try:
+            inputs = page.locator(SEL_FILE_INPUT)
+            if await inputs.count() > 0:
+                await inputs.first.set_input_files(str(imagen), timeout=8000)
+                file_set = True
+        except Exception:
+            pass
 
     if not file_set:
         await page.locator(SEL_INSERT_BUTTON).first.click()
@@ -1562,11 +1568,11 @@ async def amain():
     args = parse_args()
     t0 = time.time()
 
-    imagen = Path(args.imagen).resolve()
+    imagen = Path(args.imagen).resolve() if args.imagen else None
     prompt_path = Path(args.prompt).resolve()
     salida_json = Path(args.salida_json).resolve()
 
-    if not imagen.is_file():
+    if not args.sin_imagen and (imagen is None or not imagen.is_file()):
         salida_json.parent.mkdir(parents=True, exist_ok=True)
         salida_json.write_text(json.dumps({
             "ok": False, "error": f"imagen_no_existe: {imagen}",
@@ -1592,7 +1598,7 @@ async def amain():
         "tab_cerrado": False, "incompleto": False,
         "modo_prompt": None, "sys_prompt_chars": 0, "chat_prompt_chars": 0,
         "fecha_iso": datetime.now().isoformat(timespec='seconds'),
-        "imagen_path": str(imagen), "prompt_path": str(prompt_path),
+        "imagen_path": (str(imagen) if imagen else ""), "prompt_path": str(prompt_path),
         "modelo_pedido": args.modelo, "cdp": args.cdp,
     }
 
