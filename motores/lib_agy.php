@@ -506,10 +506,20 @@ function _agyShapeError(string $errorMsg, float $t0Total): array
  *   sandbox_path, cuota_agotada, engine.
  *
  * Extras agy (consumidos por procesarJobTranscripcionAgy):
- *   veredicto, fin_presente, websearch_detectado, websearch_patrones,
- *   websearch_fuente, tools_used, longitud_sospechosa, stdout_largo_sospechoso,
- *   estado_captura, bytes_leidos, zombis_barridos, modelo_pedido,
- *   statusline_disponible, context_window_size, used_percentage, plan_tier.
+ *   veredicto, fuente_response, fin_presente, websearch_detectado,
+ *   websearch_patrones, websearch_fuente, tools_used, longitud_sospechosa,
+ *   stdout_largo_sospechoso, estado_captura, bytes_leidos, zombis_barridos,
+ *   modelo_pedido, statusline_disponible, context_window_size,
+ *   used_percentage, plan_tier.
+ *
+ * `fuente_response` (agregado 2026-06-21) indica de dónde salió `response`
+ * para que el worker decida QA bits post-hoc:
+ *   - "ini_fin"  : INICIO y FIN visibles (camino feliz prensa).
+ *   - "ini_only" : INICIO sin FIN (truncado; QA_BIT_SIN_FIN).
+ *   - "history"  : sin INICIO/FIN; cayó al history limpio de pyte (v2 con
+ *                  prompt `[tipo:]`, o prensa con instruction-following raro).
+ *   - "screen"   : fallback al viewport visible (caso muy raro).
+ *   - "vacio"    : ningún dato útil; `ok=false`.
  */
 function _agyShapeRespuesta(
     array  $intento,
@@ -532,6 +542,7 @@ function _agyShapeRespuesta(
     $extras = [];
     if (!empty($erroresIntentos))            $extras['errores_intentos']         = $erroresIntentos;
     if (isset($data['veredicto']))           $extras['veredicto']                = $data['veredicto'];
+    if (isset($data['fuente_response']))     $extras['fuente_response']          = (string)$data['fuente_response'];
     if (array_key_exists('fin_presente', $data))
                                              $extras['fin_presente']             = (bool)$data['fin_presente'];
     if (array_key_exists('websearch_detectado', $data))

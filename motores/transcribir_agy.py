@@ -35,11 +35,24 @@ Shape de retorno del JSON (espejo de `ejecutarAiStudio()`; el wrapper
 `duracion_seg` de proc_open). Veredictos simplificados (plan #3 §2):
 SIN_FIN ya no es veredicto del .py — PHP lo detecta con qaDetectarSinFin()
 sobre `response`.
+
+Persistencia previa a discriminación (2026-06-21): `response` SIEMPRE se
+puebla con la mejor evidencia disponible y `fuente_response` reporta de
+dónde salió. PHP decide post-hoc qué hacer (QA bits según `fuente_response`).
+Caso histórico: si agy emitió la transcripción pero NO los marcadores (v2
+con prompt `[tipo:]`, o prensa con instruction-following degradado), antes
+se perdía todo + colgaba 300s; ahora viaja y agy se cierra por quiescencia.
   {
-    "ok": bool,
-    "response": str,            # desde el ÚLTIMO INICIO (inclusive) hasta el
-                                # final del history (FIN incluido si estaba);
-                                # PHP recorta AMBOS sentinelas en parseAndInsertEntradas
+    "ok": bool,                 # true si `response` no está vacío (cualquier fuente)
+    "response": str,            # mejor evidencia disponible. Jerarquía:
+                                #   1) desde el ÚLTIMO INICIO hasta el final
+                                #      del history (FIN incluido si estaba);
+                                #      PHP recorta AMBOS sentinelas en
+                                #      parseAndInsertEntradas
+                                #   2) history_text completo (sin INICIO)
+                                #   3) screen_snapshot
+                                #   4) ""
+    "fuente_response": str,     # "ini_fin" | "ini_only" | "history" | "screen" | "vacio"
     "error": str|null,
     "veredicto": "OK"|"ERROR"|"CUOTA",
     "engine": "agy",
@@ -60,7 +73,7 @@ sobre `response`.
     "tools_used": [{"name":str,"args":str}],  # parseado del TUI pre-INICIO
     "longitud_sospechosa": bool,# response < UMBRAL (espejo de aistudio)
     "stdout_largo_sospechoso": bool,  # console_raw > UMBRAL_STDOUT_SOSPECHOSO
-    "estado_captura": str,      # OK_FIN | TIMEOUT | PROC_EXIT | ERROR_SPAWN
+    "estado_captura": str,      # OK_FIN | QUIESCENT_NO_MARKER | TIMEOUT | PROC_EXIT | ERROR_SPAWN
     "duracion_seg": float,
     "bytes_leidos": int,
     "zombis_barridos": int,
@@ -146,6 +159,14 @@ UMBRAL_STDOUT_SOSPECHOSO = 180 * 1024  # forense: flag si console_raw se acerca 
 # Umbral de longitud sospechosa (espejo de transcribir_aistudio.py: el
 # parámetro fijo del Lucero como referencia). Bajado a 1000 por Tomás 2026-06-01.
 UMBRAL_LONGITUD_SOSPECHOSA = 1000
+
+# Cierre por quiescencia sin marcador (2026-06-21). Si bytes congelaron
+# `quiescent_seg` segundos Y total_bytes >= MIN_BYTES_PLAUSIBLES Y no hubo
+# INICIO/FIN, asumimos que agy terminó la respuesta y quedó ocioso esperando
+# otro turno (TUI vivo). Evita el cuelgue de 300s del v2 cuando el prompt no
+# emite los marcadores. Mientras agy trabaja, el spinner del TUI escribe
+# bytes continuos → last_byte_at se patea y este fallback no dispara.
+MIN_BYTES_PLAUSIBLES = 10 * 1024
 
 # Comando -i corto (plan §D + smoke validado): referencia @prompt.md + @imagen.jpg.
 # Evita el límite de 8191 chars del cmdline; el prompt completo está en el
@@ -285,7 +306,7 @@ def _screen_text(screen: "pyte.Screen") -> str:
 
 @dataclass
 class CaptureResult:
-    estado: str                       # OK_FIN | TIMEOUT | PROC_EXIT | ERROR_SPAWN
+    estado: str                       # OK_FIN | QUIESCENT_NO_MARKER | TIMEOUT | PROC_EXIT | ERROR_SPAWN
     fin_visto: bool
     duracion_seg: float
     bytes_leidos: int
@@ -314,12 +335,23 @@ def capturar(
     ini_marker: str = INI_MARKER,
     fin_marker: str = FIN_MARKER,
     fin_grace_seg: float = 5.0,
+    quiescent_seg: float = 30.0,
     read_size: int = 4096,
     on_chunk=None,
     verbose: bool = True,
     progress_seg: float = 10.0,
 ) -> CaptureResult:
-    """Lanza `argv` bajo ConPTY; cierra al ver candidato válido + bytes estables."""
+    """Lanza `argv` bajo ConPTY; cierra al ver candidato válido + bytes estables.
+
+    Caminos de cierre, en orden de prioridad:
+      1) OK_FIN              — apareció FIN_MARKER + `fin_grace_seg` estables.
+      2) PROC_EXIT           — agy cerró solo (raro: corona TUI ocioso).
+      3) QUIESCENT_NO_MARKER — no hubo INICIO/FIN pero los bytes congelaron
+                               `quiescent_seg` segundos con MIN_BYTES_PLAUSIBLES
+                               ya leídos. Cubre v2 (prompt `[tipo:]` sin
+                               marcadores) sin esperar al timeout.
+      4) TIMEOUT             — `timeout_seg` total agotado.
+    """
     res = CaptureResult(estado="ERROR_SPAWN", fin_visto=False, duracion_seg=0.0, bytes_leidos=0)
 
     plain = pyte.Screen(cols, rows)
@@ -447,6 +479,17 @@ def capturar(
 
             if candidato_at is not None and (now - last_byte_at) >= fin_grace_seg:
                 res.estado = "OK_FIN"
+                break
+
+            # Fallback: agy en modo TUI no se autocierra al terminar la
+            # respuesta — queda vivo esperando otro turno. Si bytes congelaron
+            # quiescent_seg con MIN_BYTES_PLAUSIBLES ya leídos y nunca vimos
+            # INICIO_MARKER, asumimos "respuesta terminada sin marcador" y
+            # cerramos. Si vinieron marcadores, OK_FIN gana antes.
+            if (candidato_at is None
+                    and total_bytes >= MIN_BYTES_PLAUSIBLES
+                    and (now - last_byte_at) >= quiescent_seg):
+                res.estado = "QUIESCENT_NO_MARKER"
                 break
 
             if verbose and (now - last_tick) >= progress_seg:
@@ -840,7 +883,7 @@ def volcar_debug_bundle(debug_dir: Path, res: CaptureResult, metrics: dict,
 # ============================================================
 
 def decidir_veredicto(res: CaptureResult) -> tuple:
-    """Mapea CaptureResult → (veredicto, response, error, fin_presente).
+    """Mapea CaptureResult → (veredicto, response, error, fin_presente, fuente_response).
 
     Plan #3 §2: set simplificado OK | ERROR | CUOTA. `SIN_FIN` ya NO es
     veredicto del .py — PHP detecta truncado con qaDetectarSinFin() sobre
@@ -848,31 +891,56 @@ def decidir_veredicto(res: CaptureResult) -> tuple:
     internamente para cerrar agy antes del timeout (evaluar_candidato +
     fin_grace_seg), pero eso no se refleja como veredicto.
 
-    Una sola fuente para `response` (plan #3 §3): partial_from_ini = texto
-    desde el ÚLTIMO INICIO hasta el final del history. Si hay FIN, queda
-    visible adentro; PHP lo recorta en parseAndInsertEntradas().
+    Persistir antes de discriminar (2026-06-21): `response` se puebla con la
+    mejor evidencia disponible, no sólo cuando hay INICIO. Jerarquía:
+      1) partial_from_ini (desde el ÚLTIMO INICIO hasta el final del history;
+         FIN incluido si estaba) → fuente "ini_fin" o "ini_only" según fin_visto.
+         PHP lo recorta en parseAndInsertEntradas(). Camino feliz prensa
+         (idéntico al pre-cambio).
+      2) history_text completo → fuente "history". Cubre: v2 con prompt
+         `[tipo:]` sin marcadores; prensa con instruction-following degradado.
+         PHP decide post-hoc (QA bit por "sin marcador").
+      3) screen_snapshot → fuente "screen". Fallback si el history quedó vacío
+         (p.ej. spawn falló muy temprano).
+      4) "" → fuente "vacio". Único caso genuino de fallo de captura.
 
-      OK    : partial_from_ini con len >= MIN_CONTENT_LEN.
-      ERROR : spawn falló, o no hay INICIO, o partial es eco vacío.
+      OK    : response no vacío (cualquier fuente).
+      ERROR : spawn falló, o todas las fuentes vacías.
       CUOTA : reservado (no se detecta auto todavía; handoff #4).
     """
     if res.estado == "ERROR_SPAWN":
-        return ("ERROR", "", res.error or "spawn_agy_fallo", False)
+        return ("ERROR", "", res.error or "spawn_agy_fallo", False, "vacio")
 
+    # 1) Camino preferido: hubo INICIO_MARKER en el history.
     partial = (res.partial_from_ini or "").strip()
     if partial and len(partial) >= MIN_CONTENT_LEN:
-        return ("OK", partial, None, bool(res.fin_visto))
+        fuente = "ini_fin" if res.fin_visto else "ini_only"
+        return ("OK", partial, None, bool(res.fin_visto), fuente)
 
+    # 2) Sin INICIO: caemos al history limpio (de-renderizado por pyte). PHP
+    #    discrimina con QA bits según `fuente_response`.
+    history = (res.history_text or "").strip()
+    if history and len(history) >= MIN_CONTENT_LEN:
+        return ("OK", history, None, False, "history")
+
+    # 3) Último recurso: snapshot de la pantalla visible.
+    screen = (res.screen_snapshot or "").strip()
+    if screen and len(screen) >= MIN_CONTENT_LEN:
+        return ("OK", screen, None, False, "screen")
+
+    # 4) Genuino fallo: nada utilizable en el grid.
     err_parts = []
     if res.estado == "TIMEOUT":
         err_parts.append(f"timeout_sin_datos_utiles (dur={res.duracion_seg}s)")
     elif res.estado == "PROC_EXIT":
         err_parts.append(f"agy_exit_sin_datos (exitstatus={res.exitstatus})")
+    elif res.estado == "QUIESCENT_NO_MARKER":
+        err_parts.append(f"quiescent_sin_datos_utiles (dur={res.duracion_seg}s)")
     else:
-        err_parts.append(f"sin_inicio (estado_captura={res.estado})")
+        err_parts.append(f"sin_datos_utiles (estado_captura={res.estado})")
     if res.notas:
         err_parts.append("notas=" + "|".join(res.notas))
-    return ("ERROR", "", "; ".join(err_parts), False)
+    return ("ERROR", "", "; ".join(err_parts), False, "vacio")
 
 
 def shape_salida(
@@ -894,8 +962,13 @@ def shape_salida(
       §4: tools_used parseado del TUI; websearch_fuente expone tools_used/heurística.
       §5: tokens_* desde statusLine si está configurado (sino 0).
       §6: cap 256 KiB; stdout_largo_sospechoso si supera 180 KiB.
+
+    Cambio 2026-06-21 (persistir antes de discriminar):
+      `response` cae a history_text/screen_snapshot si no hubo INICIO;
+      `fuente_response` reporta el origen para que PHP decida qué QA bits
+      flaggear sin necesidad de re-inferir desde el contenido.
     """
-    veredicto, response, error, fin_presente = decidir_veredicto(res)
+    veredicto, response, error, fin_presente, fuente_response = decidir_veredicto(res)
     ok = (veredicto == "OK")
     longitud_sospechosa = (
         ok and 0 < len(response) < UMBRAL_LONGITUD_SOSPECHOSA
@@ -930,6 +1003,7 @@ def shape_salida(
         "stderr_raw": "",
         "cuota_agotada": (veredicto == "CUOTA"),
         # Extras agy (consumidos por lib_agy.php + worker)
+        "fuente_response": fuente_response,
         "fin_presente": bool(fin_presente),
         "websearch_detectado": bool(ws_info.get("detectado")),
         "websearch_patrones": ws_info.get("patrones") or [],
@@ -986,6 +1060,12 @@ def parse_args():
                    help="Filas (default 100; generoso para evitar truncado del viewport).")
     p.add_argument("--grace", type=float, default=5.0,
                    help="Segundos de estabilidad tras candidato (default 5).")
+    p.add_argument("--quiescent-seg", type=float, default=30.0, dest="quiescent_seg",
+                   help="Segundos de bytes congelados SIN candidato para cerrar "
+                        "agy (default 30). Cubre prompts que no emiten INICIO/FIN "
+                        "(p.ej. familia `[tipo:]` de manuscritos-v2). Mientras agy "
+                        "trabaja el spinner del TUI emite bytes, así que este "
+                        "fallback no dispara prematuramente.")
     p.add_argument("--debug-dir", default=None, dest="debug_dir",
                    help="Si está, vuelca bundle .txt forense ahí (gateado por "
                         "system_flags.agy_debug_capture='on'). Sin esta flag, "
@@ -1030,7 +1110,8 @@ def main() -> int:
             "fin_presente": False, "websearch_detectado": False,
             "websearch_fuente": "none", "tools_used": [],
             "longitud_sospechosa": False, "stdout_largo_sospechoso": False,
-            "estado_captura": "PREFLIGHT", "cuota_agotada": False,
+            "estado_captura": "PREFLIGHT", "fuente_response": "vacio",
+            "cuota_agotada": False,
             "tokens_input": 0, "tokens_output": 0, "tokens_thought": 0,
             "tokens_cached": 0, "tokens_total": 0,
             "statusline_disponible": False,
@@ -1046,7 +1127,8 @@ def main() -> int:
             "fin_presente": False, "websearch_detectado": False,
             "websearch_fuente": "none", "tools_used": [],
             "longitud_sospechosa": False, "stdout_largo_sospechoso": False,
-            "estado_captura": "PREFLIGHT", "cuota_agotada": False,
+            "estado_captura": "PREFLIGHT", "fuente_response": "vacio",
+            "cuota_agotada": False,
             "tokens_input": 0, "tokens_output": 0, "tokens_thought": 0,
             "tokens_cached": 0, "tokens_total": 0,
             "statusline_disponible": False,
@@ -1065,7 +1147,8 @@ def main() -> int:
             "fin_presente": False, "websearch_detectado": False,
             "websearch_fuente": "none", "tools_used": [],
             "longitud_sospechosa": False, "stdout_largo_sospechoso": False,
-            "estado_captura": "PREFLIGHT", "cuota_agotada": False,
+            "estado_captura": "PREFLIGHT", "fuente_response": "vacio",
+            "cuota_agotada": False,
             "tokens_input": 0, "tokens_output": 0, "tokens_thought": 0,
             "tokens_cached": 0, "tokens_total": 0,
             "statusline_disponible": False,
@@ -1119,6 +1202,7 @@ def main() -> int:
         timeout_seg=float(args.timeout),
         ini_marker=INI_MARKER, fin_marker=FIN_MARKER,
         fin_grace_seg=float(args.grace),
+        quiescent_seg=float(args.quiescent_seg),
         verbose=True, progress_seg=15.0,
     )
 
@@ -1171,6 +1255,7 @@ def main() -> int:
             "tools_used": tools_used,
             "tokens": tokens,
             "veredicto": out["veredicto"],
+            "fuente_response": out["fuente_response"],
             "ok": out["ok"],
             "longitud_sospechosa": out["longitud_sospechosa"],
             "stdout_largo_sospechoso": out["stdout_largo_sospechoso"],
@@ -1191,6 +1276,7 @@ def main() -> int:
 
     sys.stderr.write(
         f"[agy] veredicto={out['veredicto']} ok={out['ok']} "
+        f"fuente={out['fuente_response']} estado={out['estado_captura']} "
         f"fin={out['fin_presente']} ws={out['websearch_detectado']} "
         f"tools={len(tools_used)} statusln={out['statusline_disponible']} "
         f"tok_in={out['tokens_input']} tok_out={out['tokens_output']} "
