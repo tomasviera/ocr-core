@@ -146,6 +146,46 @@ context_window_size (int), used_percentage (float), plan_tier
 
 ---
 
+## Motor AI Studio (Fase 2) — `lib_aistudio.php` + 2 scripts
+
+Segundo motor, **mismo contrato** (firma + struct) que agy; `engine='aistudio_web'`.
+Transcribe vía la web UI de Google AI Studio (Playwright + Chrome por CDP). Scripts
+sibling: `transcribir_aistudio.py` (transcripción) y `aistudio_check_login.py`
+(probe de login para `aistudioCheckLoginCDP`).
+
+```php
+ejecutarAiStudio(
+    string $promptTexto, string $imagenPath, int $jobId, string $imagenStem,
+    string $resultadosDir, array $aistudioConfig = [], int $timeout = 300,
+    int $maxIntentos = 1
+): array
+```
+
+`$aistudioConfig` (claves que lee el motor):
+
+| clave | tipo | nota |
+|---|---|---|
+| `cdp_url` | string | Chrome con CDP (default `http://localhost:9222`) |
+| `modelo` | string | modelo en el selector de AI Studio |
+| `timeout_respuesta_seg` | int | default = `$timeout` |
+| `media_resolution` | string | `High`/… (resolución de imagen) |
+| `thinking_level` | string | `''` = no tocar el dropdown |
+| `screenshot_error_dir` | string | rel → root del proyecto; abs se usa tal cual |
+| `no_cerrar_tab_error` | bool | debug: no cerrar el tab de Chrome al fallar |
+
+- Los `.py` son **siblings** del lib (`__DIR__`), no `scripts/`.
+- El **root del proyecto** se reconstruye de `$resultadosDir` (`<root>/temp`) para
+  ubicar sandbox/errores efímeros — NO se deriva de `__DIR__` (que en `core_vendor/`
+  apuntaría mal). Sirve a prensa (root=`WEB`) y v2 (root=`web/`) sin tocar el caller.
+- Struct: núcleo idéntico + extras `veredicto, fuente_dom, heuristicas,
+  media_resolution, thinking_level, modo_prompt, incompleto, longitud_sospechosa`.
+  `tokens_thought=0` (AI Studio no separa thoughts del output; van en `tokens_output`).
+- `aistudioLog()` (helper de logging usado por worker/supervisor/cuentas del
+  proyecto) **NO** está en el core: vive en el shim `includes/lib_aistudio.php` de
+  cada proyecto. El motor del core loguea por `coreLog('aistudio_web', …)`.
+
+---
+
 ## Artefacto #2 — Costura logger (convención `function_exists`)
 
 El motor del core loguea llamando a una función de **nombre fijo**, protegida por
