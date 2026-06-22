@@ -65,6 +65,17 @@ if (!function_exists('coreLog')) {
     }
 }
 
+/**
+ * Mensaje `-i` que se manda a agy en modo SIN IMAGEN (postproceso). El default
+ * del `.py` ("Transcribí la imagen @imagen.jpg…") es la instrucción equivocada
+ * para una tarea de texto puro: hacía que el modelo intentara transcribir la
+ * imagen dummy 1×1 en vez de seguir el prompt. Sólo aplica al modo sin-imagen
+ * (manuscritos-v2 postproceso); prensadelplata nunca corre sin-imagen.
+ */
+const AGY_CMD_I_SIN_IMAGEN =
+    'Seguí al pie de la letra las instrucciones de @prompt.md y devolvé únicamente '
+    . 'lo que ahí se pide. No transcribas ninguna imagen. No uses búsqueda web.';
+
 // =====================================================================
 // HELPERS
 // =====================================================================
@@ -187,7 +198,8 @@ function _agyEjecutarUnIntento(
     ?int    $cols,
     ?int    $rows,
     ?float  $grace,
-    ?string $agyBin
+    ?string $agyBin,
+    ?string $cmdI
 ): array {
     $cmd = [
         $pythonBin, '-u', $scriptPath,
@@ -224,6 +236,10 @@ function _agyEjecutarUnIntento(
     if ($agyBin !== null && $agyBin !== '') {
         $cmd[] = '--agy-bin';
         $cmd[] = $agyBin;
+    }
+    if ($cmdI !== null && $cmdI !== '') {
+        $cmd[] = '--cmd-i';
+        $cmd[] = $cmdI;
     }
 
     $workdir    = dirname($salidaJsonPath);
@@ -372,6 +388,12 @@ function ejecutarAgy(
     $rows       = isset($agyConfig['rows']) ? (int)$agyConfig['rows'] : null;
     $grace      = isset($agyConfig['grace']) ? (float)$agyConfig['grace'] : null;
     $agyBin     = isset($agyConfig['agy_bin']) ? (string)$agyConfig['agy_bin'] : null;
+    // Chat-input (-i) de agy. En modo sin-imagen (postproceso) override-eamos el
+    // default del .py (transcripción de imagen) por una instrucción de texto puro.
+    // El caller puede forzar uno propio vía $agyConfig['cmd_i'].
+    $cmdI       = isset($agyConfig['cmd_i']) && $agyConfig['cmd_i'] !== ''
+                ? (string)$agyConfig['cmd_i']
+                : ($sinImagen ? AGY_CMD_I_SIN_IMAGEN : null);
 
     // ── 1. Validar precondiciones ──
     $pythonBin = agyPython();
@@ -467,7 +489,7 @@ function ejecutarAgy(
         $imagenPath, $promptPath, $salidaJsonPath, $sandboxDir,
         $tResp, $procTimeout,
         $homeDir, $modeloAgy, $debugDir,
-        $cols, $rows, $grace, $agyBin
+        $cols, $rows, $grace, $agyBin, $cmdI
     );
 
     $data      = $resp['data'] ?? [];

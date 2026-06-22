@@ -1076,6 +1076,10 @@ def parse_args():
                         "no implementado: la mecánica ConPTY+pyte quedó validada).")
     p.add_argument("--agy-bin", default="agy", dest="agy_bin",
                    help="Ejecutable de agy (default: 'agy' en PATH).")
+    p.add_argument("--cmd-i", default=CMD_I_DEFAULT, dest="cmd_i",
+                   help="Mensaje -i que se envia a agy. Default: transcripcion de "
+                        "imagen. lib_agy.php lo override-ea en modo sin-imagen "
+                        "(postproceso) para no pedir transcribir la imagen dummy.")
     return p.parse_args()
 
 
@@ -1176,7 +1180,7 @@ def main() -> int:
     # En modo debug volcamos el log de agy al debug_dir; sin debug no escribimos
     # ningún log file extra (mantiene el sandbox limpio).
     agy_log_path: Optional[Path] = None
-    argv = [args.agy_bin, "-i", CMD_I_DEFAULT]
+    argv = [args.agy_bin, "-i", args.cmd_i]
     if debug_dir is not None:
         try:
             debug_dir.mkdir(parents=True, exist_ok=True)
