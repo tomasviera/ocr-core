@@ -47,7 +47,7 @@ declare(strict_types=1);
  * proyecto define `coreLogSink($engine, $nivel, $mensaje, $detalle)` en su
  * `core_bootstrap.php`, ruteándolo a su log de eventos:
  *   - prensadelplata → logDebug()  → transcripcion_debug_log
- *   - manuscritos-v2 → logEvento() → eventos
+ *   - manuscritos-v3 → logEvento() → eventos
  *
  * Best-effort: nunca propaga. Guardado con `function_exists` para que un segundo
  * motor del core que también lo defina (Fase 2+) no provoque redeclare.
@@ -70,7 +70,7 @@ if (!function_exists('coreLog')) {
  * del `.py` ("Transcribí la imagen @imagen.jpg…") es la instrucción equivocada
  * para una tarea de texto puro: hacía que el modelo intentara transcribir la
  * imagen dummy 1×1 en vez de seguir el prompt. Sólo aplica al modo sin-imagen
- * (manuscritos-v2 postproceso); prensadelplata nunca corre sin-imagen.
+ * (manuscritos-v3 postproceso); prensadelplata nunca corre sin-imagen.
  */
 const AGY_CMD_I_SIN_IMAGEN =
     'Seguí al pie de la letra las instrucciones de @prompt.md y devolvé únicamente '
@@ -407,7 +407,7 @@ function ejecutarAgy(
                 : ($sinImagen ? AGY_CMD_I_SIN_IMAGEN : null);
     // Modo de invocación: 'print' (-p, markdown crudo sin inflar tablas) o
     // 'interactive' (-i, legacy). Si el caller no lo setea, el .py default-ea a
-    // interactive (compat: v2 sigue en -i hasta optar).
+    // interactive (compat: v3 sigue en -i, no setea cmd_mode).
     $cmdMode    = isset($agyConfig['cmd_mode']) && $agyConfig['cmd_mode'] !== ''
                 ? (string)$agyConfig['cmd_mode'] : null;
 
@@ -424,9 +424,9 @@ function ejecutarAgy(
         return _agyShapeError("script_no_encontrado: $scriptPath", $t0Total);
     }
 
-    // Postproceso (v2): modo sin imagen real. agy igual necesita un image.jpg
+    // Postproceso (v3): modo sin imagen real. agy igual necesita un image.jpg
     // copiable en su sandbox aunque el prompt no lo referencie → el motor crea
-    // una dummy 1×1 en el workdir (antes esto vivía en el caller de v2). El .py
+    // una dummy 1×1 en el workdir (antes esto vivía en el caller de v3). El .py
     // no cambia: recibe una imagen real (mínima).
     if (!$sinImagen && !is_file($imagenPath)) {
         return _agyShapeError("imagen_no_existe: $imagenPath", $t0Total);
@@ -525,7 +525,7 @@ function ejecutarAgy(
 /**
  * Bytes de un JPEG 1×1 (dummy). Lo usa el modo $sinImagen: agy exige un
  * image.jpg copiable en su sandbox aunque el prompt no lo referencie (postproceso
- * de v2). Antes vivía en el caller (lib_postprocesador::_postprocDummyJpg).
+ * de v3). Antes vivía en el caller (lib_postprocesador::_postprocDummyJpg).
  */
 function _agyDummyJpgBytes(): string
 {

@@ -35,7 +35,7 @@ declare(strict_types=1);
 
 /**
  * Costura de logging del core (convención + function_exists). El proyecto
- * consumidor define coreLogSink() (prensa → logDebug; v2 → logEvento). Guardado
+ * consumidor define coreLogSink() (prensa → logDebug; v3 → logEvento). Guardado
  * por function_exists: si lib_agy.php ya lo definió al cargar primero, se omite.
  * Defensivo: un fallo de logging nunca tumba un job.
  */
@@ -460,7 +460,7 @@ function ejecutarAiStudio(
     $t0Total = microtime(true);
     // CORE: la lib vive en core_vendor/motores/ — NO se deriva el root del
     // proyecto de __DIR__. Se reconstruye del $resultadosDir que pasa el worker
-    // (siempre <root_proyecto>/temp), así sirve a prensa (root=WEB) y a v2
+    // (siempre <root_proyecto>/temp), así sirve a prensa (root=WEB) y a v3
     // (root=web/) sin tocar el caller. Sólo se usa para resolver sandbox/errores
     // efímeros; el script .py es sibling (__DIR__), abajo.
     $proyectoRoot = dirname(rtrim($resultadosDir, "/\\"));
@@ -521,7 +521,7 @@ function ejecutarAiStudio(
     // .b64 lo decodificamos directo al sandbox; si es una imagen real, se copia.
     // (Mismo contrato que ejecutarGeminiCLI(), que también decodifica .b64.)
     if ($sinImagen) {
-        // Postproceso (v2): modo sin imagen real. No se materializa image.jpg en
+        // Postproceso (v3): modo sin imagen real. No se materializa image.jpg en
         // el sandbox; el .py recibe --sin-imagen y no adjunta nada (AI Studio web
         // no puede mandar una dummy sin que se vea, a diferencia de agy).
     } elseif (strtolower(substr($imagenPath, -4)) === '.b64') {

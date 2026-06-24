@@ -1064,7 +1064,7 @@ def parse_args():
     p.add_argument("--quiescent-seg", type=float, default=30.0, dest="quiescent_seg",
                    help="Segundos de bytes congelados SIN candidato para cerrar "
                         "agy (default 30). Cubre prompts que no emiten INICIO/FIN "
-                        "(p.ej. familia `[tipo:]` de manuscritos-v2). Mientras agy "
+                        "(p.ej. familia `[tipo:]` de manuscritos-v3). Mientras agy "
                         "trabaja el spinner del TUI emite bytes, así que este "
                         "fallback no dispara prematuramente.")
     p.add_argument("--debug-dir", default=None, dest="debug_dir",
@@ -1189,7 +1189,7 @@ def main() -> int:
     # auth IGUAL exige el TTY de ConPTY: un pipe normal a `agy -p` sale vacío. El
     # resto del pipeline (ConPTY, pyte, extracción INICIO/FIN, kill/barrido) queda
     # idéntico. cmd_mode='interactive' (-i) es el legacy y el DEFAULT por compat
-    # (transcriptor-manuscritos-v2 sigue en -i hasta optar; prensa opta vía lib_agy).
+    # (transcriptor-manuscritos-v3 sigue en -i, no setea cmd_mode; prensa opta vía lib_agy).
     # Validado 2026-06-24: prensadelplata/WEB/temp/tests/2026-06-24_agy_print_{AB,C}.
     # En modo debug volcamos el log de agy al debug_dir; sin debug no escribimos
     # ningún log file extra (mantiene el sandbox limpio).

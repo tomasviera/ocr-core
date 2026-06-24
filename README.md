@@ -1,7 +1,7 @@
 # ocr-core
 
 Núcleo compartido de los proyectos de OCR-por-LLM **prensadelplata** (A) y
-**transcriptor-manuscritos-v2** (B). Contiene motores de proveedor e infra común,
+**transcriptor-manuscritos-v3** (B). Contiene motores de proveedor e infra común,
 **agnósticos al dominio**. Cada proyecto **vendoriza** una copia fijada de una
 versión (`core_vendor/` + `core_version.txt`); este repo (`E:\ocr-core`) es el
 **único lugar donde se edita** el código compartido.
@@ -278,7 +278,7 @@ Cada proyecto define `coreLogSink(...)` ruteando a SU log de eventos:
 // prensadelplata  → transcripcion_debug_log
 function coreLogSink($engine, $nivel, $msg, $detalle) { logDebug($engine, $nivel, $msg, $detalle); }
 
-// manuscritos-v2  → eventos
+// manuscritos-v3  → eventos
 function coreLogSink($engine, $nivel, $msg, $detalle) { logEvento($engine, $nivel, $msg, $detalle); }
 ```
 

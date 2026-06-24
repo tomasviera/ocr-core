@@ -5,7 +5,7 @@
 
 .DESCRIPTION
   Este script es la PLANTILLA que se copia a la raíz de cada proyecto consumidor
-  (prensadelplata\WEB, transcriptor-manuscritos-v2). Corrido desde la raíz de un
+  (prensadelplata\WEB, transcriptor-manuscritos-v3). Corrido desde la raíz de un
   proyecto, extrae el árbol del core en el tag <Version> y lo copia a
   <proyecto>\core_vendor\, inyecta el header "GENERADO — no editar acá" en cada
   .php/.py vendorizado, y escribe core_version.txt.
