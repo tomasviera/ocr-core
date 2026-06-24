@@ -23,6 +23,7 @@ Lo invoca PHP (`web/includes/lib_agy.php`) desde un sandbox PRE-TRUSTED en
       [--home-dir C:/Users/Tomas/.gemini] \\
       [--modelo-agy "Gemini 3.5 Flash (Low)"] \\
       [--timeout 300] \\
+      [--cmd-mode interactive|print]   # print = -p (markdown crudo, sin inflar tablas) \\
       [--debug-dir temp/agy_debug/<job>_edi<edi>_p<pag>_<ts>]
 
 Filosofía one-shot estricta (plan §"Cambios por archivo"):
@@ -1077,9 +1078,14 @@ def parse_args():
     p.add_argument("--agy-bin", default="agy", dest="agy_bin",
                    help="Ejecutable de agy (default: 'agy' en PATH).")
     p.add_argument("--cmd-i", default=CMD_I_DEFAULT, dest="cmd_i",
-                   help="Mensaje -i que se envia a agy. Default: transcripcion de "
-                        "imagen. lib_agy.php lo override-ea en modo sin-imagen "
-                        "(postproceso) para no pedir transcribir la imagen dummy.")
+                   help="Mensaje del prompt que se envia a agy (con -i o -p). Default: "
+                        "transcripcion de imagen. lib_agy.php lo override-ea en modo "
+                        "sin-imagen (postproceso) para no pedir transcribir la imagen dummy.")
+    p.add_argument("--cmd-mode", default="interactive", dest="cmd_mode",
+                   choices=["interactive", "print"],
+                   help="interactive=-i (TUI legacy, default por compat); print=-p "
+                        "(no-interactivo: agy imprime markdown crudo SIN inflar tablas y "
+                        "cierra solo). prensa opta a 'print' via lib_agy; v2 sigue en -i.")
     return p.parse_args()
 
 
@@ -1176,11 +1182,22 @@ def main() -> int:
         env["USERPROFILE"] = str(home_dir)
         env["HOME"] = str(home_dir)
 
-    # ── Comando agy: -i corto + (opcionalmente) --log-file en debug ──
+    # ── Comando agy: -i (interactivo, TUI) o -p (print, no-interactivo) ──
+    # cmd_mode='print' (-p): agy imprime el markdown CRUDO del modelo y cierra solo
+    # (PROC_EXIT) → NO infla tablas (el TUI de -i las paddea a ancho de terminal, lo
+    # que con cols=2000 inflaba las tablas markdown) y no necesita el taskkill. La
+    # auth IGUAL exige el TTY de ConPTY: un pipe normal a `agy -p` sale vacío. El
+    # resto del pipeline (ConPTY, pyte, extracción INICIO/FIN, kill/barrido) queda
+    # idéntico. cmd_mode='interactive' (-i) es el legacy y el DEFAULT por compat
+    # (transcriptor-manuscritos-v2 sigue en -i hasta optar; prensa opta vía lib_agy).
+    # Validado 2026-06-24: prensadelplata/WEB/temp/tests/2026-06-24_agy_print_{AB,C}.
     # En modo debug volcamos el log de agy al debug_dir; sin debug no escribimos
     # ningún log file extra (mantiene el sandbox limpio).
     agy_log_path: Optional[Path] = None
-    argv = [args.agy_bin, "-i", args.cmd_i]
+    if args.cmd_mode == "print":
+        argv = [args.agy_bin, "-p", args.cmd_i, "--print-timeout", f"{int(args.timeout)}s"]
+    else:
+        argv = [args.agy_bin, "-i", args.cmd_i]
     if debug_dir is not None:
         try:
             debug_dir.mkdir(parents=True, exist_ok=True)

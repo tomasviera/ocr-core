@@ -199,7 +199,8 @@ function _agyEjecutarUnIntento(
     ?int    $rows,
     ?float  $grace,
     ?string $agyBin,
-    ?string $cmdI
+    ?string $cmdI,
+    ?string $cmdMode
 ): array {
     $cmd = [
         $pythonBin, '-u', $scriptPath,
@@ -240,6 +241,13 @@ function _agyEjecutarUnIntento(
     if ($cmdI !== null && $cmdI !== '') {
         $cmd[] = '--cmd-i';
         $cmd[] = $cmdI;
+    }
+    // Modo de invocación de agy: 'interactive' (-i, legacy) o 'print' (-p, sin
+    // inflar tablas). El .py default-ea a interactive si no se pasa → degradación
+    // segura si un vendor viejo no manda este flag.
+    if ($cmdMode !== null && $cmdMode !== '') {
+        $cmd[] = '--cmd-mode';
+        $cmd[] = $cmdMode;
     }
 
     $workdir    = dirname($salidaJsonPath);
@@ -355,6 +363,9 @@ function _agyEjecutarUnIntento(
  *                                     'timeout_respuesta_seg' (default $timeout)
  *                                     'cols','rows','grace','agy_bin' (overrides
  *                                                              opcionales del .py)
+ *                                     'cmd_mode'              ('print' = -p sin inflar
+ *                                                              tablas; 'interactive' = -i
+ *                                                              legacy. Default .py: interactive)
  * @param int     $timeout           Compat: timeout por intento (s). Default 300.
  * @param int     $maxIntentos       NO se usa: corre 1 intento. La política de
  *                                   reintento vive en el worker (lib_worker_policy.php).
@@ -394,6 +405,11 @@ function ejecutarAgy(
     $cmdI       = isset($agyConfig['cmd_i']) && $agyConfig['cmd_i'] !== ''
                 ? (string)$agyConfig['cmd_i']
                 : ($sinImagen ? AGY_CMD_I_SIN_IMAGEN : null);
+    // Modo de invocación: 'print' (-p, markdown crudo sin inflar tablas) o
+    // 'interactive' (-i, legacy). Si el caller no lo setea, el .py default-ea a
+    // interactive (compat: v2 sigue en -i hasta optar).
+    $cmdMode    = isset($agyConfig['cmd_mode']) && $agyConfig['cmd_mode'] !== ''
+                ? (string)$agyConfig['cmd_mode'] : null;
 
     // ── 1. Validar precondiciones ──
     $pythonBin = agyPython();
@@ -489,7 +505,7 @@ function ejecutarAgy(
         $imagenPath, $promptPath, $salidaJsonPath, $sandboxDir,
         $tResp, $procTimeout,
         $homeDir, $modeloAgy, $debugDir,
-        $cols, $rows, $grace, $agyBin, $cmdI
+        $cols, $rows, $grace, $agyBin, $cmdI, $cmdMode
     );
 
     $data      = $resp['data'] ?? [];
