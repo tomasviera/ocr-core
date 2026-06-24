@@ -22,7 +22,10 @@ ocr-core/
 ├── bump_core.ps1           # publicar versión nueva del core (commit + tag + push)
 ├── motores/                # ejecutarAgy()/ejecutarAistudio()/… → struct. (Fase 1+)
 ├── infra/                  # database.php, lib_logger.php (Fase 4)
-└── utils/                  # qa_base, sandbox, cuota_windows, sentinels (Fase 3)
+├── utils/                  # qa_base, sandbox, cuota_windows, sentinels (Fase 3)
+└── prompts/                # render de prompts componibles (puro) + schema compartido
+    ├── lib_prompt_render.php   # render Mustache-lite agnóstico al dominio
+    └── schema_compartido.sql   # DDL de prompt_bases/fragmentos/modelo_addenda
 ```
 
 En **v0** (Fase 0) `motores/ infra/ utils/` están vacíos (solo `.gitkeep`).
@@ -203,6 +206,51 @@ El "cómo" del sin-imagen difiere por motor (inherente); el **contrato y la lóg
 del caller son idénticos** (un flag). Un proyecto que llame motores para
 transcripción *y* postproceso usa la misma función con `$sinImagen` distinto —
 en v2 vía el dispatcher único `ejecutarMotor()`.
+
+---
+
+## Artefacto #3 — Render de prompts componibles (`prompts/`)
+
+Parte **agnóstica al dominio** del sistema de prompts componibles de prensa.
+Mismo patrón que los motores: **el core es lógica pura; cómo cada proyecto
+discrimina/invoca es project-side.**
+
+**Qué lee el core:** SÓLO las 3 tablas reutilizables `prompt_bases`,
+`prompt_fragmentos`, `prompt_modelo_addenda`, vía el `$pdo` que **inyecta el
+proyecto**. Nunca abre conexión propia.
+
+**Qué NO sabe / NO toca el core:** la tabla `prompts` (project-specific), los
+periódicos, los legajos, ni cualquier discriminador de dominio. El proyecto arma
+**project-side** el array de prompt YA RESUELTO + el diccionario de contexto, y
+el core re-renderiza.
+
+```php
+// Entry-point único del core:
+renderizarPromptAdHoc(PDO $pdo, array $promptAdHoc, array $contexto): string
+```
+
+`$promptAdHoc`: `pro_baslinaje` (int|null; NULL → devuelve `pro_texto` literal),
+`pro_texto` (fallback), `pro_fragmentosextra` (array|JSON de slugs),
+`pro_familia` (override opcional de familia), `pro_modelo`/`pro_endpoint`
+(auto-detección de familia si no hay override).
+
+**Familia de la addenda** (precedencia): `$contexto['_familia_override']` →
+`$promptAdHoc['pro_familia']` → `detectarFamiliaModelo($endpoint,$modelo)`.
+
+**Sintaxis Mustache-lite:** `{{var}}`, dot `{{a.b}}`, `{{#if x}}…{{/if}}`
+(anidable; sin `{{^}}` → modelar con un booleano de contexto), `{{> slug}}`
+(recursivo, anti-ciclo), `{{! comentario }}`, token `{{addenda_modelo}}`.
+
+**Schema:** `prompts/schema_compartido.sql` (DDL idéntico entre proyectos →
+anti-drift). Lo aplica el `init_db.php` de cada proyecto; el core no lo ejecuta.
+`*_proposito` queda como TEXT libre (cada proyecto usa su vocabulario).
+
+**Caché estática por request** de los cargadores: una edición de base/fragmento
+a mitad de corrida del worker no se ve hasta el próximo request.
+
+**Funciones project-side (NO en el core):** `renderizarPrompt()` (SELECT FROM
+`prompts`), `cargarVariablesPeriodico()`, `construirContextoRender*()`,
+`propagarBaseAPrompts()` (versiona la tabla `prompts`).
 
 ---
 

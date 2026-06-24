@@ -118,8 +118,8 @@ try {
     }
     New-Item -ItemType Directory -Path $vendor -Force | Out-Null
 
-    # --- 4. Copiar motores/infra/utils + VERSION + README ---
-    foreach ($d in @('motores', 'infra', 'utils')) {
+    # --- 4. Copiar motores/infra/utils/prompts + VERSION + README ---
+    foreach ($d in @('motores', 'infra', 'utils', 'prompts')) {
         $src = Join-Path $tmp $d
         if (Test-Path $src) { Copy-Item $src -Destination $vendor -Recurse -Force }
     }
