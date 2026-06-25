@@ -564,6 +564,75 @@ def _resolver_imagen_al_sandbox(imagen_src: Path, dst_jpg: Path) -> Optional[str
     return None
 
 
+# Entradas del sandbox que NO se borran entre corridas: `.agents` (config de
+# permisos). `imagen.jpg`/`prompt.md` los reescribe preparar_sandbox a
+# continuación, así que NO hace falta preservarlos. Todo lo demás es residuo de
+# una corrida anterior y se elimina.
+_SANDBOX_KEEP = {".agents"}
+
+
+def _limpiar_estado_agy(sandbox_dir: Path, scratch_dir: Optional[Path]) -> None:
+    """Borra el estado escribible de agy ANTES de cada corrida (fix freeze 2026-06-25).
+
+    Causa raíz del freeze: en `-p`, agy stagea/lee `@imagen.jpg`/`@prompt.md`
+    desde su propio `scratch` (`<home>/.gemini/antigravity-cli/scratch`), NO
+    desde el `--sandbox-dir`. Si una corrida deja una copia ahí, las corridas
+    siguientes (conversación nueva — UUID distinto — pero MISMO filesystem) la
+    releen y devuelven la transcripción de una página vieja, congelada. Además
+    agy escribe basura en el sandbox (`crop_*.py`, `inspection/`, `{cwd}/`,
+    `image.jpg`) cuando decide "explorar/programar" en vez de transcribir.
+
+    Vaciar ambos antes de cada corrida garantiza que un fallo en una corrida no
+    influya en las posteriores y que `@imagen.jpg` (cwd=sandbox) resuelva al
+    archivo fresco. Best-effort: loguea a stderr pero nunca aborta el job.
+    """
+    def _borrar(entry: Path) -> None:
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink()
+        except Exception as e:
+            sys.stderr.write(f"[agy] WARN no pude limpiar {entry}: {e}\n")
+
+    # 1) Vaciar el scratch de agy (la fuente real del freeze).
+    if scratch_dir is not None and scratch_dir.is_dir():
+        for entry in scratch_dir.iterdir():
+            _borrar(entry)
+
+    # 2) Dejar el sandbox sólo con lo canónico (.agents); preparar_sandbox
+    #    reescribe imagen.jpg + prompt.md inmediatamente después.
+    if sandbox_dir.is_dir():
+        for entry in sandbox_dir.iterdir():
+            if entry.name in _SANDBOX_KEEP:
+                continue
+            _borrar(entry)
+
+
+def _stagear_en_scratch(scratch_dir: Optional[Path], sandbox_dir: Path) -> None:
+    """Copia la imagen+prompt FRESCOS del job al scratch de agy (fix freeze 2026-06-25).
+
+    Empíricamente agy en `-p` resuelve `@imagen.jpg`/`@prompt.md` de forma
+    NO determinística: a veces los lee del cwd (=sandbox), a veces sale a
+    "buscarlos en el user directory" y termina mirando su `scratch`. Vaciar el
+    scratch (paso previo) mata el contenido stale pero deja el caso "no los
+    encuentra → explora → no transcribe". La solución robusta es servirle la
+    copia FRESCA del job TAMBIÉN en el scratch: lea de donde lea (sandbox o
+    scratch), siempre obtiene la imagen correcta de ESTE job, nunca una vieja.
+
+    Se llama DESPUÉS de preparar_sandbox (que ya validó/escribió los archivos en
+    el sandbox). Best-effort: loguea a stderr pero no aborta.
+    """
+    if scratch_dir is None:
+        return
+    try:
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(sandbox_dir / "imagen.jpg", scratch_dir / "imagen.jpg")
+        shutil.copy2(sandbox_dir / "prompt.md", scratch_dir / "prompt.md")
+    except Exception as e:
+        sys.stderr.write(f"[agy] WARN no pude stagear en scratch ({scratch_dir}): {e}\n")
+
+
 def preparar_sandbox(sandbox_dir: Path, imagen_src: Path, prompt_src: Path) -> Optional[str]:
     """Asegura sandbox_dir/{imagen.jpg,prompt.md,.agents/settings.json}.
 
@@ -1147,6 +1216,14 @@ def main() -> int:
         })
         return 3
 
+    # ── Limpieza de estado escribible de agy (fix freeze por scratch stale, 2026-06-25) ──
+    # agy en -p lee @imagen.jpg desde <home>/.gemini/antigravity-cli/scratch, no
+    # del sandbox; sin esto, una corrida que dejó copias ahí congela a todas las
+    # siguientes. Se limpia ANTES de stagear los archivos frescos.
+    _base_home = home_dir if home_dir is not None else Path.home()
+    _scratch_dir = _base_home / ".gemini" / "antigravity-cli" / "scratch"
+    _limpiar_estado_agy(sandbox_dir, _scratch_dir)
+
     # ── Sandbox: copia/decodifica imagen y prompt + .agents/settings.json ──
     err_sand = preparar_sandbox(sandbox_dir, imagen, prompt_path)
     if err_sand:
@@ -1166,6 +1243,11 @@ def main() -> int:
             "fecha_iso": datetime.now().isoformat(timespec='seconds'),
         })
         return 3
+
+    # Servir la copia FRESCA del job también en el scratch de agy: lea del cwd
+    # (=sandbox) o salga a buscar a su scratch, siempre obtiene la imagen de
+    # ESTE job, nunca una vieja (fix freeze 2026-06-25).
+    _stagear_en_scratch(_scratch_dir, sandbox_dir)
 
     # ── Modelo global (NO-OP si --modelo-agy vacío) ──
     err_mod = setear_modelo_global(home_dir, args.modelo_agy)
