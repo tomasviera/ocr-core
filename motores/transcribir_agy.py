@@ -1365,7 +1365,32 @@ def main() -> int:
         sys.stderr.write(traceback.format_exc())
         return 4
 
-    # ── Debug dump (sólo si --debug-dir) ──
+    # ── Forensics forzados para exploracion_agy ──
+    # Si el check de exploración disparó (shape_salida override a ERROR) y
+    # debug_dir está apagado, lo derivamos del salida_json para preservar
+    # el bundle igual. Caso raro pero crítico: si el check fuera falso
+    # positivo necesitamos la evidencia (history_text, console_raw, metrics,
+    # extracted_*) para auditarlo. Path análogo a worker.php:1640-1642
+    # (temp/agy_debug/<basename_del_workdir>). agy_log_path queda en None
+    # porque agy se lanzó sin --log-file (gateado por debug_dir al inicio);
+    # el resto del bundle SÍ se escribe desde `res` ya capturado.
+    if (debug_dir is None
+            and out.get("ok") is False
+            and "exploracion_agy" in (out.get("error") or "")):
+        try:
+            workdir_name = salida_json.parent.name
+            # salida_json = .../temp/agy_subprocess/<workdir>/salida.json
+            #            → .../temp/agy_debug/<workdir>/
+            debug_dir = salida_json.parent.parent.parent / "agy_debug" / workdir_name
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            sys.stderr.write(
+                f"[agy] forense exploracion_agy: debug_dir auto-forzado → {debug_dir}\n"
+            )
+        except Exception as e:
+            sys.stderr.write(f"[agy] WARN forense exploracion: no pude crear debug_dir: {e}\n")
+            debug_dir = None
+
+    # ── Debug dump (si --debug-dir o forensics auto-forzados) ──
     if debug_dir is not None:
         metrics = {
             "estado_captura": res.estado,
