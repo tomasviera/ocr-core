@@ -1044,6 +1044,30 @@ def shape_salida(
         ok and 0 < len(response) < UMBRAL_LONGITUD_SOSPECHOSA
     )
 
+    # Firma "exploración agy": el modelo usó run_command (Get-ChildItem, etc.)
+    # para buscar los archivos en vez de leer @imagen.jpg, y devolvió como
+    # respuesta el mensaje conversacional de exploración ("Estoy buscando…").
+    # Tres flags concurrentes la identifican unívocamente vs una transcripción
+    # real (incluso de página casi vacía, que siempre lleva marcadores):
+    #   - fuente_response == "history": no hubo INICIO/FIN
+    #   - not fin_presente: tampoco el cierre suelto
+    #   - longitud_sospechosa: response < UMBRAL_LONGITUD_SOSPECHOSA
+    # Caso 2026-06-25 (job 7123 prensa, edi 2961 p4): response="Estoy
+    # buscando los archivos imagen.jpg y prompt.md en tu sistema…" (198
+    # chars) entró como transcripción vigente. Ver notas/motor_agy.md
+    # §Permisos (los denies de tool() son no-op; único lever real es
+    # prompt+modelo). Forzar ERROR acá protege a TODOS los consumidores
+    # del core (prensa + v3); response queda en el dict para que PHP lo
+    # logue en api_rawresponse y el operador audite qué dijo el modelo.
+    if ok and fuente_response == "history" and not fin_presente and longitud_sospechosa:
+        ok = False
+        veredicto = "ERROR"
+        error = (
+            f"exploracion_agy: response cae a history (sin INICIO/FIN), "
+            f"len={len(response)} < UMBRAL={UMBRAL_LONGITUD_SOSPECHOSA}; "
+            f"agy probablemente exploró con run_command en vez de transcribir"
+        )
+
     stdout_raw_full = res.console_raw or ""
     stdout_largo_sospechoso = len(stdout_raw_full) > UMBRAL_STDOUT_SOSPECHOSO
     stdout_capado = stdout_raw_full
