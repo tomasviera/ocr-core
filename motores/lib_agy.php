@@ -639,6 +639,10 @@ function _agyShapeRespuesta(
     if (isset($data['context_window_size'])) $extras['context_window_size']      = (int)$data['context_window_size'];
     if (isset($data['used_percentage']))     $extras['used_percentage']          = (float)$data['used_percentage'];
     if (isset($data['plan_tier']))           $extras['plan_tier']                = $data['plan_tier'];
+    // Segundos hasta el reset de cuota (parseado del 429 "Resets in 13m27s" en
+    // la .db de la conversación). 0 si no se pudo parsear → el worker usará el
+    // default `agy_cooldown_seg` como fallback.
+    if (isset($data['cuota_reset_seg']))     $extras['cuota_reset_seg']          = (int) $data['cuota_reset_seg'];
 
     // Token usage del statusLine side-channel (leído por el .py tras cerrar agy).
     // Si el setup manual del statusLine no se hizo, todos quedan en 0. A

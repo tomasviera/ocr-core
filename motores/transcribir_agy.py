@@ -103,10 +103,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import glob
 import json
+import os
 import queue
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -322,6 +325,12 @@ class CaptureResult:
     exitstatus: Optional[int] = None
     error: Optional[str] = None
     notas: list = field(default_factory=list)
+    # Detección de cuota agotada (HTTP 429) leída del .db de la conversación de
+    # ESTE job (ver _detectar_cuota_en_conversacion). En `-p` el 429 no llega a
+    # consola/history → vive sólo en SQLite. Si True, decidir_veredicto retorna
+    # CUOTA y shape_salida marca `cuota_agotada=true`.
+    cuota_detectada: bool = False
+    cuota_reset_seg: Optional[int] = None  # parseado de "Resets in 13m27s"; None si no se pudo
 
 
 def capturar(
@@ -830,6 +839,87 @@ def detectar_websearch(res: CaptureResult, tools_used: list) -> dict:
 
 
 # ============================================================
+# DETECCIÓN DE CUOTA AGY (HTTP 429) — SQLite de la conversación
+# ============================================================
+# En `-p` el 429 RESOURCE_EXHAUSTED NO llega a consola/history (vive sólo en
+# `~/.gemini/antigravity-cli/conversations/<uuid>.db`, tabla `steps`, columnas
+# `step_payload`/`error_details`). Sin esto el wrapper veía exit 0 + stdout
+# vacío y reportaba el genérico `agy_exit_sin_datos`, sin poder distinguir
+# "cuota agotada" de "agy se rompió". Detector validado 2026-06-25 contra 109
+# .db reales (cero falsos positivos: hits limpios en las conversaciones de la
+# franja de cuota agotada; sin hits en las previas que sí completaron).
+#
+# agy es serial por usuario Windows (tope 1 por cuenta) → la .db modificada
+# durante esta corrida es la de ESTE job. Filtramos por mtime >= t_launch-2s
+# para no leer .db de un job previo.
+
+_PRINTABLE = re.compile(rb"[\x20-\x7e]{4,}")
+_PAT_CUOTA = re.compile(
+    r"RESOURCE_EXHAUSTED|Individual quota reached|quota reached|HTTP 429|code[ \"]*:?\s*429",
+    re.IGNORECASE,
+)
+_PAT_RESET = re.compile(
+    r"Resets?\s+in\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?",
+    re.IGNORECASE,
+)
+
+
+def _detectar_cuota_en_conversacion(conv_dir: str, t_launch: float) -> tuple:
+    """Busca `RESOURCE_EXHAUSTED` / "Individual quota reached" / HTTP 429 en la
+    .db de la conversación de ESTE job.
+
+    Devuelve `(cuota: bool, reset_seg: int|None)` — `reset_seg` parseado de
+    "Resets in 13m27s" cuando agy lo trae adosado. Si no aparece, devuelve
+    `(False, None)` o `(True, None)` según el match.
+
+    Lectura `mode=ro` con timeout corto: best-effort, nunca aborta el job (el
+    .py sigue con el flujo normal aunque esto falle).
+    """
+    try:
+        dbs = [
+            p for p in glob.glob(os.path.join(conv_dir, "*.db"))
+            if os.path.getmtime(p) >= t_launch - 2
+        ]
+    except Exception:
+        return (False, None)
+    dbs.sort(key=os.path.getmtime, reverse=True)
+    for db in dbs[:3]:
+        try:
+            uri = "file:" + db.replace("\\", "/") + "?mode=ro"
+            con = sqlite3.connect(uri, uri=True, timeout=2)
+            try:
+                try:
+                    rows = con.execute(
+                        "SELECT step_payload, error_details FROM steps"
+                    ).fetchall()
+                except Exception:
+                    rows = con.execute("SELECT step_payload FROM steps").fetchall()
+            finally:
+                con.close()
+        except Exception:
+            continue
+        parts = []
+        for row in rows:
+            for b in row:
+                if b is None:
+                    continue
+                if isinstance(b, str):
+                    b = b.encode("utf-8", "replace")
+                parts += [m.group().decode("ascii", "replace")
+                          for m in _PRINTABLE.finditer(b)]
+        blob = "\n".join(parts)
+        if _PAT_CUOTA.search(blob):
+            reset_seg = None
+            m = _PAT_RESET.search(blob)
+            if m and any(m.groups()):
+                reset_seg = (int(m.group(1) or 0) * 3600
+                             + int(m.group(2) or 0) * 60
+                             + int(m.group(3) or 0))
+            return (True, reset_seg)
+    return (False, None)
+
+
+# ============================================================
 # TOKEN USAGE — side-channel statusLine (plan #3 §5)
 # ============================================================
 # El "Thought for Xs, Yk tokens" del TUI NO desagrega input/output/cache.
@@ -981,6 +1071,17 @@ def decidir_veredicto(res: CaptureResult) -> tuple:
     if res.estado == "ERROR_SPAWN":
         return ("ERROR", "", res.error or "spawn_agy_fallo", False, "vacio")
 
+    # 0) Cuota agotada (HTTP 429): si `_detectar_cuota_en_conversacion` halló
+    #    el RESOURCE_EXHAUSTED en la .db de esta corrida, devolvemos CUOTA
+    #    antes que cualquier otra cosa. Con esto el wrapper PHP (lib_agy +
+    #    worker) ya no ve `agy_exit_sin_datos` enmascarando un 429, sino el
+    #    veredicto correcto → cooldown + rotación. El `cuota_reset_seg` lo
+    #    leva shape_salida al dict de salida.
+    if getattr(res, "cuota_detectada", False):
+        return ("CUOTA", "",
+                "cuota_agotada: 429 RESOURCE_EXHAUSTED (Individual quota reached)",
+                False, "cuota")
+
     # 1) Camino preferido: hubo INICIO_MARKER en el history.
     partial = (res.partial_from_ini or "").strip()
     if partial and len(partial) >= MIN_CONTENT_LEN:
@@ -1096,6 +1197,10 @@ def shape_salida(
         "stdout_raw": stdout_capado,
         "stderr_raw": "",
         "cuota_agotada": (veredicto == "CUOTA"),
+        # Segundos hasta el reset de cuota (parseado de "Resets in 13m27s" en el
+        # 429 de la .db). 0 si no se pudo parsear o no aplica → el worker usará
+        # el default `agy_cooldown_seg` como fallback.
+        "cuota_reset_seg": int(getattr(res, "cuota_reset_seg", 0) or 0),
         # Extras agy (consumidos por lib_agy.php + worker)
         "fuente_response": fuente_response,
         "fin_presente": bool(fin_presente),
@@ -1246,6 +1351,10 @@ def main() -> int:
     # siguientes. Se limpia ANTES de stagear los archivos frescos.
     _base_home = home_dir if home_dir is not None else Path.home()
     _scratch_dir = _base_home / ".gemini" / "antigravity-cli" / "scratch"
+    # Conversaciones (.db SQLite) de agy: las usa _detectar_cuota_en_conversacion
+    # post-captura para leer el 429 RESOURCE_EXHAUSTED que en `-p` no llega a
+    # consola/history.
+    _conv_dir = _base_home / ".gemini" / "antigravity-cli" / "conversations"
     _limpiar_estado_agy(sandbox_dir, _scratch_dir)
 
     # ── Sandbox: copia/decodifica imagen y prompt + .agents/settings.json ──
@@ -1340,6 +1449,22 @@ def main() -> int:
     zombis = _barrido_zombis(pids_prev, t_epoch)
     if zombis:
         time.sleep(0.3)
+
+    # ── Detección de cuota agotada (HTTP 429) en la .db de esta corrida ──
+    # En `-p` el 429 RESOURCE_EXHAUSTED no llega a consola/history; vive sólo
+    # en SQLite. Sin esto, una corrida agotada por cuota reportaría el genérico
+    # `agy_exit_sin_datos` y el worker no podría rotar/cooldownear la cuenta.
+    # Best-effort: si falla la lectura, sigue el flujo normal.
+    try:
+        _cuota, _reset_seg = _detectar_cuota_en_conversacion(str(_conv_dir), t_epoch)
+        if _cuota:
+            res.cuota_detectada = True
+            res.cuota_reset_seg = _reset_seg
+            sys.stderr.write(
+                f"[agy] cuota_agotada detectada en .db (reset_seg={_reset_seg})\n"
+            )
+    except Exception as _e:
+        sys.stderr.write(f"[agy] WARN _detectar_cuota_en_conversacion: {_e}\n")
 
     # ── Parseo estructurado de tools del TUI (plan #3 §4) ──
     tools_used = parsear_tool_calls(res.history_text or "")
