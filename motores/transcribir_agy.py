@@ -534,6 +534,490 @@ def capturar(
 
 
 # ============================================================
+# /usage SCREEN — captura interactiva + parser
+# ============================================================
+#
+# Branch del --modo=usage: lanza `agy` SIN args (abre TUI), espera quiescencia
+# inicial (READY), escribe "/usage\r" al stdin del PTY, espera quiescencia
+# post-comando (USAGE), parsea el bloque GEMINI MODELS del snapshot final y
+# devuelve un dict con weekly_pct_usado, weekly_reset_seg, h5_pct_usado,
+# h5_reset_seg, account_email, plan_tier + el raw_screen.
+#
+# Por qué reusar el motor de captura: capturar() está cableado a marcadores
+# INICIO/FIN y a la lógica fin_grace. Para /usage necesitamos un pattern
+# distinto (2 quiescencias + 1 write). Por eso esto es una función paralela
+# simplificada, embebida acá (no duplica el lector ni el grid pyte; lo único
+# duplicado es el loop de drenado por quiescencia). Validado en
+# `scratchpad/probe_agy_usage/probe_interactive.py` (corrida real con
+# `purusit@gmail.com`, snapshot completo de GEMINI MODELS + CLAUDE).
+
+# Quiescencias / timeouts del modo usage. Cold start de agy puede ir hasta ~80s
+# la primera vez del proceso (auth + experiments); en caliente es ~10s para que
+# el TUI esté listo. El round del /usage en sí ronda ~6s.
+USAGE_READY_QUIESCENT_SEG = 5.0
+USAGE_READY_TIMEOUT_SEG   = 90.0
+USAGE_POST_QUIESCENT_SEG  = 5.0
+USAGE_POST_TIMEOUT_SEG    = 45.0
+
+# Regex para el texto "35% remaining · Refreshes in 125h 28m" o "Quota available".
+# Tomás decidió 2026-06-27 NO parsear el bar (decisión menos frágil): el texto
+# del header trae el dato remaining entero + la ventana al reset legible.
+# Granularidad 1% alcanza para el umbral de pausa (default 90%).
+_USAGE_REMAINING_RE = re.compile(
+    r"(?P<rem>\d+)%\s+remaining\s*·\s*Refreshes\s+in\s+"
+    r"(?:(?P<h>\d+)h\s*)?(?:(?P<m>\d+)m)?", re.IGNORECASE)
+_USAGE_QUOTA_AVAILABLE_RE = re.compile(r"\bQuota\s+available\b", re.IGNORECASE)
+# El bloque GEMINI MODELS está delimitado por su header. El siguiente bloque
+# ("CLAUDE AND GPT MODELS") corta el alcance del parser para no mezclarlos.
+_USAGE_GEMINI_BLOCK_RE = re.compile(
+    r"GEMINI\s+MODELS\s*\n(.*?)(?=\n\s*[A-Z][A-Z ]{3,}\s*MODELS\b|\Z)",
+    re.IGNORECASE | re.DOTALL)
+_USAGE_WEEKLY_LABEL_RE = re.compile(r"Weekly\s+Limit", re.IGNORECASE)
+_USAGE_5H_LABEL_RE     = re.compile(r"Five\s+Hour\s+Limit", re.IGNORECASE)
+_USAGE_ACCOUNT_RE      = re.compile(
+    r"Account:\s*(?P<email>[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+    re.IGNORECASE)
+# Plan tier viene en el corona del TUI, junto al email entre paréntesis.
+# Ej: "purusit@gmail.com (Google AI Pro)".
+_USAGE_PLAN_RE = re.compile(
+    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\s*\(([^()\n]+)\)")
+
+
+def _parse_usage_segmento(seg_text: str) -> tuple:
+    """Parsea un segmento (Weekly o Five Hour) y devuelve (pct_usado, reset_seg)
+    o (None, None) si no se pudo parsear. Granularidad: 1% (entero); reset_seg
+    en segundos (=0 cuando dice "Quota available")."""
+    if not seg_text:
+        return (None, None)
+    if _USAGE_QUOTA_AVAILABLE_RE.search(seg_text):
+        return (0.0, 0)  # 100% remaining → 0% usado, reset_seg = 0
+    m = _USAGE_REMAINING_RE.search(seg_text)
+    if not m:
+        return (None, None)
+    rem = int(m.group("rem"))
+    pct_usado = max(0.0, min(100.0, 100.0 - float(rem)))
+    horas = int(m.group("h") or 0)
+    mins  = int(m.group("m") or 0)
+    reset_seg = horas * 3600 + mins * 60
+    return (pct_usado, reset_seg)
+
+
+def parsear_usage_screen(snapshot: str) -> dict:
+    """Parsea el snapshot del TUI tras `/usage` y devuelve un dict con los
+    campos de cuota del grupo GEMINI MODELS (Flash + Pro). El grupo CLAUDE se
+    ignora (prensa no lo consume). Devuelve campos None cuando no se puede
+    parsear: el upsert PHP los persiste tal cual y el monitor los muestra
+    "(sin dato)"."""
+    out = {
+        "account_email":    None,
+        "plan_tier":        None,
+        "weekly_pct_usado": None,
+        "weekly_reset_seg": None,
+        "h5_pct_usado":     None,
+        "h5_reset_seg":     None,
+        "gemini_block_found": False,
+        "parser_notes":     [],
+    }
+    if not snapshot:
+        out["parser_notes"].append("snapshot_vacio")
+        return out
+
+    em = _USAGE_ACCOUNT_RE.search(snapshot)
+    if em:
+        out["account_email"] = em.group("email")
+    pm = _USAGE_PLAN_RE.search(snapshot)
+    if pm:
+        out["plan_tier"] = pm.group(1).strip()
+
+    bm = _USAGE_GEMINI_BLOCK_RE.search(snapshot)
+    if not bm:
+        out["parser_notes"].append("bloque_gemini_no_encontrado")
+        return out
+    out["gemini_block_found"] = True
+    bloque = bm.group(1)
+
+    # Cortar el bloque en sub-bloques por las etiquetas Weekly / Five Hour.
+    # La estructura real (probe 2026-06-27):
+    #   Models within this group: ...
+    #   Weekly Limit
+    #     [bar] 34.59%
+    #     35% remaining · Refreshes in 125h 28m
+    #   Five Hour Limit
+    #     [bar] 56.86%
+    #     57% remaining · Refreshes in 1h 55m
+    w_m = _USAGE_WEEKLY_LABEL_RE.search(bloque)
+    h_m = _USAGE_5H_LABEL_RE.search(bloque)
+
+    if w_m:
+        # Segmento weekly = desde "Weekly Limit" hasta "Five Hour Limit" (o fin).
+        ini = w_m.end()
+        fin = h_m.start() if (h_m and h_m.start() > ini) else len(bloque)
+        weekly_pct, weekly_reset = _parse_usage_segmento(bloque[ini:fin])
+        out["weekly_pct_usado"] = weekly_pct
+        out["weekly_reset_seg"] = weekly_reset
+        if weekly_pct is None:
+            out["parser_notes"].append("weekly_segmento_no_parseado")
+    else:
+        out["parser_notes"].append("weekly_label_no_encontrado")
+
+    if h_m:
+        ini = h_m.end()
+        # El segmento 5h va hasta el fin del bloque GEMINI MODELS.
+        h5_pct, h5_reset = _parse_usage_segmento(bloque[ini:])
+        out["h5_pct_usado"] = h5_pct
+        out["h5_reset_seg"] = h5_reset
+        if h5_pct is None:
+            out["parser_notes"].append("h5_segmento_no_parseado")
+    else:
+        out["parser_notes"].append("h5_label_no_encontrado")
+
+    return out
+
+
+def capturar_slash_command(
+    argv: list,
+    *,
+    slash_cmd: str,
+    cwd: Optional[str] = None,
+    env: Optional[dict] = None,
+    cols: int = 220,
+    rows: int = 80,
+    ready_quiescent_seg: float = USAGE_READY_QUIESCENT_SEG,
+    ready_timeout_seg:   float = USAGE_READY_TIMEOUT_SEG,
+    post_quiescent_seg:  float = USAGE_POST_QUIESCENT_SEG,
+    post_timeout_seg:    float = USAGE_POST_TIMEOUT_SEG,
+    read_size: int = 4096,
+    verbose: bool = True,
+) -> dict:
+    """Lanza `argv` bajo ConPTY; espera quiescencia (TUI listo) y manda
+    `slash_cmd` + Enter al stdin del PTY; espera quiescencia post-comando;
+    devuelve el snapshot pyte final + history + raw + métricas.
+
+    Patrón distinto al de `capturar()` (sin marcadores INICIO/FIN): cierra
+    SIEMPRE por quiescencia (`bytes congelados N segundos`). Sin
+    MIN_BYTES_PLAUSIBLES — el TUI ya pintó el corona antes de la primera
+    quiescencia, así que cualquier cantidad de bytes nuevos vale.
+
+    Devuelve dict con: ok, snapshot, history, raw, bytes_total, exitstatus,
+    pid, estado, error, duracion_seg, ready_ok (bool), post_ok (bool).
+    """
+    plain = pyte.Screen(cols, rows)
+    plain_stream = pyte.Stream(plain)
+    hist = pyte.HistoryScreen(cols, rows, history=4000, ratio=0.5)
+    hist_stream = pyte.Stream(hist)
+
+    raw_parts: list = []
+    total_bytes = 0
+    t0 = time.monotonic()
+    estado = "ERROR_SPAWN"
+    error: Optional[str] = None
+    pid: Optional[int] = None
+    exitstatus: Optional[int] = None
+    ready_ok = False
+    post_ok = False
+
+    try:
+        proc = winpty.PtyProcess.spawn(argv, cwd=cwd, env=env, dimensions=(rows, cols))
+    except Exception as e:
+        error = f"spawn: {type(e).__name__}: {e}"
+        return {
+            "ok": False, "snapshot": "", "history": "", "raw": "",
+            "bytes_total": 0, "exitstatus": None, "pid": None,
+            "estado": estado, "error": error,
+            "duracion_seg": round(time.monotonic() - t0, 2),
+            "ready_ok": False, "post_ok": False,
+        }
+    pid = getattr(proc, "pid", None)
+    if verbose:
+        sys.stderr.write(f"[agy-usage] spawn OK pid={pid} argv={argv}\n")
+
+    q: "queue.Queue" = queue.Queue()
+    stop_flag = threading.Event()
+
+    def _reader():
+        while not stop_flag.is_set():
+            try:
+                ch = proc.read(read_size)
+            except EOFError:
+                q.put(None)
+                return
+            except Exception as e:
+                q.put(("__EXC__", f"{type(e).__name__}: {e}"))
+                return
+            if ch:
+                q.put(ch)
+            else:
+                if not proc.isalive():
+                    q.put(None)
+                    return
+                time.sleep(0.02)
+
+    reader = threading.Thread(target=_reader, name="conpty-usage-reader", daemon=True)
+    reader.start()
+
+    def _drenar(quiescent_seg: float, total_timeout: float, label: str) -> bool:
+        """Drena el queue hasta que pasen N segundos sin nuevos bytes (o
+        total_timeout). Devuelve True si quiescente, False si TIMEOUT o PROC_EXIT."""
+        nonlocal total_bytes
+        local_t0 = time.monotonic()
+        last_byte = local_t0
+        bytes_at_entry = total_bytes
+        last_tick = local_t0
+        while True:
+            now = time.monotonic()
+            if now - local_t0 >= total_timeout:
+                if verbose:
+                    sys.stderr.write(
+                        f"[agy-usage] {label}: TIMEOUT t={int(now-local_t0)}s "
+                        f"bytes_nuevos={total_bytes-bytes_at_entry}\n")
+                return False
+            try:
+                item = q.get(timeout=0.2)
+                if item is None:
+                    if verbose:
+                        sys.stderr.write(f"[agy-usage] {label}: PROC_EXIT\n")
+                    return False
+                elif isinstance(item, tuple) and item and item[0] == "__EXC__":
+                    if verbose:
+                        sys.stderr.write(f"[agy-usage] {label}: reader exc {item[1]}\n")
+                    return False
+                else:
+                    raw_parts.append(item)
+                    total_bytes += len(item)
+                    last_byte = now
+                    plain_stream.feed(item)
+                    hist_stream.feed(item)
+            except queue.Empty:
+                pass
+            if ((now - last_byte) >= quiescent_seg
+                    and (total_bytes - bytes_at_entry) > 0):
+                if verbose:
+                    sys.stderr.write(
+                        f"[agy-usage] {label}: QUIESCENT t={int(now-local_t0)}s "
+                        f"bytes_nuevos={total_bytes-bytes_at_entry}\n")
+                return True
+            if verbose and int(now - last_tick) >= 10:
+                last_tick = now
+                sys.stderr.write(
+                    f"[agy-usage] {label}: t={int(now-local_t0)}s "
+                    f"bytes_nuevos={total_bytes-bytes_at_entry} alive={proc.isalive()}\n")
+
+    try:
+        # FASE 1: esperar TUI listo
+        ready_ok = _drenar(ready_quiescent_seg, ready_timeout_seg, "READY")
+        if not ready_ok:
+            estado = "READY_TIMEOUT"
+            error = "tui_no_listo_dentro_de_timeout"
+        else:
+            # FASE 2: mandar slash command + Enter
+            try:
+                proc.write(slash_cmd + "\r")
+                if verbose:
+                    sys.stderr.write(f"[agy-usage] write OK: {slash_cmd!r}\n")
+            except Exception as e:
+                estado = "WRITE_FAIL"
+                error = f"write_fail: {type(e).__name__}: {e}"
+                ready_ok = False  # tratado como fallido
+            if estado != "WRITE_FAIL":
+                # FASE 3: esperar respuesta
+                post_ok = _drenar(post_quiescent_seg, post_timeout_seg, "USAGE")
+                if not post_ok:
+                    estado = "POST_TIMEOUT"
+                    error = "respuesta_no_quiescent_dentro_de_timeout"
+                else:
+                    estado = "OK_QUIESCENT"
+    finally:
+        stop_flag.set()
+        try:
+            exitstatus = proc.exitstatus
+        except Exception:
+            pass
+        try:
+            if proc.isalive():
+                proc.terminate(force=True)
+        except Exception:
+            pass
+
+    snapshot = _screen_text(plain)
+    history  = _history_text(hist)
+    raw      = "".join(raw_parts)
+    duracion = round(time.monotonic() - t0, 2)
+
+    return {
+        "ok": (estado == "OK_QUIESCENT") and post_ok,
+        "snapshot": snapshot,
+        "history": history,
+        "raw": raw,
+        "bytes_total": total_bytes,
+        "exitstatus": exitstatus,
+        "pid": pid,
+        "estado": estado,
+        "error": error,
+        "duracion_seg": duracion,
+        "ready_ok": ready_ok,
+        "post_ok": post_ok,
+    }
+
+
+def main_usage(args, t0_total: float) -> int:
+    """Branch del --modo=usage. Espejo simplificado de main(): no toca scratch,
+    no prepara sandbox, no setea modelo global, no levanta agy con prompt; sólo
+    abre la TUI, manda /usage, parsea y escribe el JSON.
+
+    El sandbox tiene que existir (se pasa a Popen como cwd; sin él el ConPTY
+    falla con "directorio no válido"). Pero NO se escribe nada adentro."""
+    salida_json = Path(args.salida_json).resolve()
+    sandbox_dir = Path(args.sandbox_dir).resolve()
+    home_dir = Path(args.home_dir).resolve() if args.home_dir else None
+    debug_dir = Path(args.debug_dir).resolve() if args.debug_dir else None
+
+    # Pre-flight mínimo: el sandbox debe existir (cwd del PTY).
+    if not sandbox_dir.is_dir():
+        _escribir_salida_temprana(salida_json, {
+            "ok": False, "engine": "agy", "modo": "usage",
+            "veredicto": "ERROR",
+            "error": f"sandbox_dir_no_existe: {sandbox_dir}",
+            "account_email": None, "plan_tier": None,
+            "weekly_pct_usado": None, "weekly_reset_seg": None,
+            "h5_pct_usado": None, "h5_reset_seg": None,
+            "raw_screen": "",
+            "duracion_seg": round(time.time() - t0_total, 2),
+            "fecha_iso": datetime.now().isoformat(timespec='seconds'),
+        })
+        return 3
+
+    # Env: si --home-dir está, pisamos USERPROFILE/HOME (mismo gesto que
+    # main() — los keyrings/auth no se afectan porque viven en el Credential
+    # Manager por SID; ver motor_agy.md §"Multi-slot same-cuenta"). NO
+    # tocamos APPDATA/LOCALAPPDATA (agy.exe no los usa, validado por probe).
+    env = None
+    if home_dir is not None:
+        env = dict(os.environ)
+        env["USERPROFILE"] = str(home_dir)
+        env["HOME"] = str(home_dir)
+
+    # NO llamamos _limpiar_estado_agy NI _stagear_en_scratch. Justificación:
+    # (1) /usage no necesita @imagen.jpg ni @prompt.md; vaciar el scratch lo
+    # único que haría es destruir el estado de la próxima transcripción real
+    # (vendría con _limpiar_estado_agy igual, pero gratis); (2) NO escribimos
+    # nada al sandbox tampoco (preparar_sandbox no se llama). Después de esta
+    # corrida el scratch queda con lo que sea que hubiera + algún subdir nuevo
+    # de la conversación efímera que abrió agy bajo el SID actual. Eso es OK:
+    # la próxima transcripción seguirá su pipeline y lo limpiará.
+
+    argv_usage = [args.agy_bin]  # SIN args = abre TUI (con autenticación normal)
+    cap = capturar_slash_command(
+        argv_usage,
+        slash_cmd="/usage",
+        cwd=str(sandbox_dir),
+        env=env,
+        cols=220, rows=80,
+        ready_quiescent_seg=USAGE_READY_QUIESCENT_SEG,
+        ready_timeout_seg=float(args.timeout),
+        post_quiescent_seg=USAGE_POST_QUIESCENT_SEG,
+        post_timeout_seg=USAGE_POST_TIMEOUT_SEG,
+        verbose=True,
+    )
+
+    # Si el subprocess de agy NO cerró solo, agy quedó vivo (TUI esperando otro
+    # turno). Por las dudas barrer su árbol — agy interactivo a veces deja un
+    # language server detached.
+    if cap.get("pid"):
+        try:
+            _kill_arbol(cap["pid"])
+        except Exception as _e:
+            sys.stderr.write(f"[agy-usage] WARN _kill_arbol: {_e}\n")
+        time.sleep(0.3)
+        try:
+            _barrido_zombis(_pids_agy_actuales(), t0_total)
+        except Exception as _e:
+            sys.stderr.write(f"[agy-usage] WARN _barrido_zombis: {_e}\n")
+
+    parsed = parsear_usage_screen(cap.get("snapshot", ""))
+
+    # Determinar veredicto. Hay 3 niveles:
+    #   ERROR: la captura no llegó al post-quiescent o el bloque GEMINI MODELS
+    #          no se encontró. La cuenta no se upsertea (ultimo_check_ok=false
+    #          en PHP).
+    #   OK   : se encontró el bloque GEMINI MODELS y SE PUDO parsear el segmento
+    #          weekly (el dato crítico para el umbral). El segmento 5h es
+    #          opcional (puede que no se haya emitido por alguna razón).
+    #   OK pero incompleto: bloque encontrado pero NO se pudo parsear weekly.
+    #          Tratamos como ERROR (el operador puede ver los notes para
+    #          diagnosticar) porque el dato weekly es el que decide el pausado.
+    cap_ok = bool(cap.get("ok"))
+    gemini_ok = bool(parsed.get("gemini_block_found"))
+    weekly_ok = parsed.get("weekly_pct_usado") is not None
+    veredicto_ok = cap_ok and gemini_ok and weekly_ok
+    if not veredicto_ok:
+        if not cap_ok:
+            error_msg = f"captura_fallo: estado={cap.get('estado')} err={cap.get('error')}"
+        elif not gemini_ok:
+            error_msg = (f"bloque_gemini_no_encontrado en snapshot ({len(cap.get('snapshot') or '')} chars); "
+                         f"parser_notes={parsed.get('parser_notes')}")
+        else:
+            error_msg = (f"weekly_no_parseado; parser_notes={parsed.get('parser_notes')}")
+    else:
+        error_msg = None
+
+    out = {
+        "ok": veredicto_ok,
+        "engine": "agy",
+        "modo": "usage",
+        "veredicto": "OK" if veredicto_ok else "ERROR",
+        "error": error_msg,
+        "account_email":    parsed.get("account_email"),
+        "plan_tier":        parsed.get("plan_tier"),
+        "weekly_pct_usado": parsed.get("weekly_pct_usado"),
+        "weekly_reset_seg": parsed.get("weekly_reset_seg"),
+        "h5_pct_usado":     parsed.get("h5_pct_usado"),
+        "h5_reset_seg":     parsed.get("h5_reset_seg"),
+        "raw_screen":       cap.get("snapshot", ""),
+        "duracion_seg":     round(time.time() - t0_total, 2),
+        "estado_captura":   cap.get("estado"),
+        "bytes_total":      cap.get("bytes_total", 0),
+        "ready_ok":         cap.get("ready_ok", False),
+        "post_ok":          cap.get("post_ok", False),
+        "parser_notes":     parsed.get("parser_notes", []),
+        "fecha_iso":        datetime.now().isoformat(timespec='seconds'),
+    }
+
+    try:
+        salida_json.parent.mkdir(parents=True, exist_ok=True)
+        salida_json.write_text(
+            json.dumps(out, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception as e:
+        sys.stderr.write(f"FATAL: no pude escribir salida JSON: {e}\n")
+        sys.stderr.write(traceback.format_exc())
+        return 4
+
+    # Debug dump opcional (mismo gesto que el path transcribir).
+    if debug_dir is not None:
+        try:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            (debug_dir / "usage_snapshot.txt").write_text(out["raw_screen"], encoding='utf-8')
+            (debug_dir / "usage_history.txt").write_text(cap.get("history", ""), encoding='utf-8')
+            (debug_dir / "usage_raw.txt").write_text(cap.get("raw", ""), encoding='utf-8', errors='replace')
+            (debug_dir / "usage_metrics.json").write_text(json.dumps({
+                "ok": out["ok"], "veredicto": out["veredicto"], "estado": out["estado_captura"],
+                "bytes_total": out["bytes_total"], "duracion_seg": out["duracion_seg"],
+                "ready_ok": out["ready_ok"], "post_ok": out["post_ok"],
+                "error": out["error"], "parser_notes": out["parser_notes"],
+            }, indent=2, ensure_ascii=False), encoding='utf-8')
+        except Exception as _e:
+            sys.stderr.write(f"[agy-usage] WARN debug dump: {_e}\n")
+
+    sys.stderr.write(
+        f"[agy-usage] veredicto={out['veredicto']} ok={out['ok']} "
+        f"wk_pct={out['weekly_pct_usado']} wk_reset={out['weekly_reset_seg']} "
+        f"h5_pct={out['h5_pct_usado']} h5_reset={out['h5_reset_seg']} "
+        f"email={out['account_email']} tier={out['plan_tier']} "
+        f"dur={out['duracion_seg']}s bytes={out['bytes_total']}\n"
+    )
+    return 0
+
+
+# ============================================================
 # SANDBOX (espejo de preparar_sandbox del smoke + decode .b64 al estilo aistudio)
 # ============================================================
 
@@ -1232,10 +1716,20 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Wrapper Antigravity CLI (agy) via ConPTY + pyte"
     )
-    p.add_argument("--imagen", required=True,
-                   help="Ruta absoluta a la imagen (.jpg/.png/.b64).")
-    p.add_argument("--prompt", required=True,
-                   help="Ruta absoluta al prompt.md completo (con addenda agy).")
+    p.add_argument("--modo", default="transcribir", dest="modo",
+                   choices=["transcribir", "usage"],
+                   help="'transcribir' (default) = corre el pipeline OCR de imagen. "
+                        "'usage' = abre la TUI de agy, manda `/usage` por stdin del PTY, "
+                        "parsea el snapshot resultante para extraer cuota weekly/5h del "
+                        "grupo GEMINI MODELS y devuelve un JSON con el snapshot. NO toca "
+                        "scratch ni sandbox (skipea limpieza+staging) para no contaminar "
+                        "la próxima transcripción. NO requiere --imagen/--prompt.")
+    p.add_argument("--imagen", required=False, default=None,
+                   help="Ruta absoluta a la imagen (.jpg/.png/.b64). "
+                        "Requerido sólo en --modo=transcribir.")
+    p.add_argument("--prompt", required=False, default=None,
+                   help="Ruta absoluta al prompt.md completo (con addenda agy). "
+                        "Requerido sólo en --modo=transcribir.")
     p.add_argument("--salida-json", required=True, dest="salida_json",
                    help="Ruta absoluta donde escribir el JSON con el resultado.")
     p.add_argument("--sandbox-dir", required=True, dest="sandbox_dir",
@@ -1301,6 +1795,16 @@ def _escribir_salida_temprana(salida_json: Path, payload: dict) -> None:
 def main() -> int:
     args = parse_args()
     t0_total = time.time()
+
+    # Branch del --modo=usage: pipeline corto (TUI + /usage + parser). NO
+    # comparte path con transcripción (no toca scratch/sandbox/modelo global).
+    if args.modo == "usage":
+        return main_usage(args, t0_total)
+
+    # Para --modo=transcribir, --imagen y --prompt son obligatorios.
+    if not args.imagen or not args.prompt:
+        sys.stderr.write("ERROR: --modo=transcribir requiere --imagen y --prompt.\n")
+        return 3
 
     imagen = Path(args.imagen).resolve()
     prompt_path = Path(args.prompt).resolve()

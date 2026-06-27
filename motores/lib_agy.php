@@ -522,6 +522,229 @@ function ejecutarAgy(
         conservarWorkdir: $conservar, cuotaAgotada: $cuota, erroresIntentos: []);
 }
 
+// =====================================================================
+// CHEQUEO DE CUOTA via /usage (rama distinta a la transcripción)
+// =====================================================================
+
+/**
+ * Pide a agy el reporte de cuota (`/usage` por stdin del TUI) y devuelve un
+ * shape con los datos parseados del grupo GEMINI MODELS.
+ *
+ * Análogo a ejecutarAgy() pero MUCHO más simple: el .py corre con
+ * `--modo=usage`, abre la TUI sin args, manda `/usage\r`, parsea el snapshot
+ * y devuelve un JSON con account_email/plan_tier/weekly/h5. NO toca scratch ni
+ * sandbox (no rompe la próxima transcripción), NO necesita prompt ni imagen.
+ *
+ * Reutiliza la maquinaria de _agyEjecutarUnIntento via un helper interno
+ * dedicado (firma corta: sólo lo que /usage necesita).
+ *
+ * Shape de retorno:
+ *   [
+ *     'ok'               => bool,
+ *     'veredicto'        => 'OK'|'ERROR',
+ *     'error'            => ?string,
+ *     'account_email'    => ?string,
+ *     'plan_tier'        => ?string,
+ *     'weekly_pct_usado' => ?float,    // 0–100, NULL si no se pudo parsear
+ *     'weekly_reset_seg' => ?int,      // segundos hasta el reset (0 = Quota available)
+ *     'h5_pct_usado'     => ?float,
+ *     'h5_reset_seg'     => ?int,
+ *     'raw_screen'       => string,    // snapshot crudo del TUI tras /usage
+ *     'duracion_seg'     => float,
+ *     'estado_captura'   => ?string,   // OK_QUIESCENT | READY_TIMEOUT | POST_TIMEOUT | …
+ *     'bytes_total'      => int,
+ *     'exit_code'        => ?int,
+ *     'parser_notes'     => string[],
+ *     'engine'           => 'agy',
+ *   ]
+ *
+ * @param string  $sandboxDir Sandbox PRE-TRUSTED del slot agy. Sólo se usa
+ *                            como cwd del subprocess. NO se modifica.
+ * @param ?string $homeDir    Override del HOME (mismo gesto que ejecutarAgy).
+ *                            NULL = HOME del usuario Windows que corre el worker.
+ * @param int     $timeoutSeg Tope total del subprocess. Cubre cold start
+ *                            (~80s la 1ra del proceso) + round del /usage (~6s)
+ *                            + margen. Default 120.
+ * @param ?string $workdirBase Base del workdir efímero del wrapper. Si null,
+ *                             cae al sys temp.
+ * @param ?string $debugDir   Si se pasa, el .py vuelca `usage_snapshot.txt` +
+ *                            history + raw + metrics en ese dir.
+ */
+function chequearUsageAgy(
+    string  $sandboxDir,
+    ?string $homeDir   = null,
+    int     $timeoutSeg = 120,
+    ?string $workdirBase = null,
+    ?string $debugDir = null
+): array {
+    $t0Total = microtime(true);
+
+    $pythonBin = agyPython();
+    if ($pythonBin === null) {
+        return _agyShapeUsageError('python_no_encontrado: instalar Python y agregarlo al PATH', $t0Total);
+    }
+    $scriptPath = __DIR__ . DIRECTORY_SEPARATOR . 'transcribir_agy.py';
+    if (!is_file($scriptPath)) {
+        return _agyShapeUsageError("script_no_encontrado: $scriptPath", $t0Total);
+    }
+    if ($sandboxDir === '' || !is_dir($sandboxDir)) {
+        return _agyShapeUsageError("sandbox_dir_invalido: '$sandboxDir' (lo entrega agyReclamarSlot)", $t0Total);
+    }
+
+    // Workdir efímero (mismo patrón que ejecutarAgy).
+    $workdirRoot = ($workdirBase !== null && $workdirBase !== '' && is_dir($workdirBase))
+        ? $workdirBase
+        : sys_get_temp_dir();
+    $workdirBaseDir = rtrim(str_replace(['/', '\\'], DIRECTORY_SEPARATOR, $workdirRoot), DIRECTORY_SEPARATOR)
+                    . DIRECTORY_SEPARATOR . 'agy_subprocess';
+    @mkdir($workdirBaseDir, 0755, true);
+    agyLimpiarWorkdirsHuerfanos($workdirBaseDir, 2.0);
+
+    $ts = date('Hisv');
+    $workdir = $workdirBaseDir . DIRECTORY_SEPARATOR . "usage_check_{$ts}";
+    if (!@mkdir($workdir, 0755, true) && !is_dir($workdir)) {
+        return _agyShapeUsageError("workdir_no_se_pudo_crear: $workdir", $t0Total);
+    }
+    $salidaJsonPath = $workdir . DIRECTORY_SEPARATOR . 'salida.json';
+
+    if ($debugDir !== null && $debugDir !== '') {
+        @mkdir($debugDir, 0755, true);
+    }
+
+    coreLog('agy', 'INFO', "Chequeando cuota agy via /usage (sandbox={$sandboxDir})", [
+        'sandbox_dir' => $sandboxDir, 'home_dir' => $homeDir, 'timeout' => $timeoutSeg,
+    ]);
+
+    $cmd = [
+        $pythonBin, '-u', $scriptPath,
+        '--modo', 'usage',
+        '--salida-json', $salidaJsonPath,
+        '--sandbox-dir', $sandboxDir,
+        '--timeout',     (string)$timeoutSeg,
+    ];
+    if ($homeDir !== null && $homeDir !== '') {
+        $cmd[] = '--home-dir';
+        $cmd[] = $homeDir;
+    }
+    if ($debugDir !== null && $debugDir !== '') {
+        $cmd[] = '--debug-dir';
+        $cmd[] = $debugDir;
+    }
+
+    $stdoutFile = $workdir . DIRECTORY_SEPARATOR . 'stdout.log';
+    $stderrFile = $workdir . DIRECTORY_SEPARATOR . 'stderr.log';
+    @unlink($stdoutFile);
+    @unlink($stderrFile);
+    @unlink($salidaJsonPath);
+
+    $descriptorSpec = [
+        0 => ['pipe', 'r'],
+        1 => ['file', $stdoutFile, 'w'],
+        2 => ['file', $stderrFile, 'w'],
+    ];
+    $env = array_merge($_SERVER, $_ENV, ['PYTHONIOENCODING' => 'utf-8']);
+    $envFiltrado = [];
+    foreach ($env as $k => $v) {
+        if (is_string($k) && is_string($v)) $envFiltrado[$k] = $v;
+    }
+
+    // Cap del proceso: timeout del subprocess (cold start cubierto en el .py
+    // como READY_TIMEOUT) + margen para barrido de zombies + escritura del JSON.
+    $procTimeout = $timeoutSeg + 60;
+
+    $t0 = microtime(true);
+    $exitCode = -1;
+    $timedOut = false;
+
+    $proc = @proc_open($cmd, $descriptorSpec, $pipes, $workdir, $envFiltrado);
+    if ($proc === false) {
+        return _agyShapeUsageError("proc_open_fallo", $t0Total);
+    }
+    if (isset($pipes[0])) fclose($pipes[0]);
+
+    while (true) {
+        $status = proc_get_status($proc);
+        if (!$status['running']) {
+            $exitCode = $status['exitcode'];
+            break;
+        }
+        if (microtime(true) - $t0 > $procTimeout) {
+            $pid = $status['pid'] ?? 0;
+            if ($pid > 0 && PHP_OS_FAMILY === 'Windows') {
+                @exec("taskkill /F /T /PID {$pid} 2>nul");
+            }
+            proc_terminate($proc);
+            for ($i = 0; $i < 30; $i++) {
+                usleep(100_000);
+                if (!proc_get_status($proc)['running']) break;
+            }
+            $timedOut = true;
+            break;
+        }
+        usleep(300_000);
+    }
+    proc_close($proc);
+
+    $duracion = microtime(true) - $t0;
+    $data = [];
+    if (is_file($salidaJsonPath)) {
+        $raw = @file_get_contents($salidaJsonPath);
+        if ($raw !== false && $raw !== '') {
+            $parsed = @json_decode($raw, true);
+            if (is_array($parsed)) $data = $parsed;
+        }
+    }
+
+    // Conservar el workdir efímero salvo éxito limpio (mismo criterio que
+    // ejecutarAgy: deja la traza para auditar).
+    $ok = !empty($data['ok']);
+    if ($ok && $debugDir === null) {
+        agyBorrarWorkdir($workdir);
+    }
+
+    return [
+        'ok'               => $ok,
+        'veredicto'        => $data['veredicto'] ?? ($timedOut ? 'ERROR' : 'ERROR'),
+        'error'            => $data['error'] ?? ($timedOut ? 'proc_timeout' : ($exitCode === 0 ? null : "exit_code={$exitCode} sin_salida_json")),
+        'account_email'    => $data['account_email']    ?? null,
+        'plan_tier'        => $data['plan_tier']        ?? null,
+        'weekly_pct_usado' => isset($data['weekly_pct_usado']) ? (float) $data['weekly_pct_usado'] : null,
+        'weekly_reset_seg' => isset($data['weekly_reset_seg']) ? (int) $data['weekly_reset_seg'] : null,
+        'h5_pct_usado'     => isset($data['h5_pct_usado']) ? (float) $data['h5_pct_usado'] : null,
+        'h5_reset_seg'     => isset($data['h5_reset_seg']) ? (int) $data['h5_reset_seg'] : null,
+        'raw_screen'       => (string) ($data['raw_screen'] ?? ''),
+        'duracion_seg'     => round(microtime(true) - $t0Total, 2),
+        'estado_captura'   => $data['estado_captura'] ?? null,
+        'bytes_total'      => (int) ($data['bytes_total'] ?? 0),
+        'exit_code'        => $exitCode,
+        'parser_notes'     => $data['parser_notes'] ?? [],
+        'engine'           => 'agy',
+    ];
+}
+
+/** Shape de error preflight para chequearUsageAgy (sin workdir). */
+function _agyShapeUsageError(string $errorMsg, float $t0Total): array
+{
+    return [
+        'ok'               => false,
+        'veredicto'        => 'ERROR_PREFLIGHT',
+        'error'            => $errorMsg,
+        'account_email'    => null,
+        'plan_tier'        => null,
+        'weekly_pct_usado' => null,
+        'weekly_reset_seg' => null,
+        'h5_pct_usado'     => null,
+        'h5_reset_seg'     => null,
+        'raw_screen'       => '',
+        'duracion_seg'     => round(microtime(true) - $t0Total, 2),
+        'estado_captura'   => null,
+        'bytes_total'      => 0,
+        'exit_code'        => null,
+        'parser_notes'     => [],
+        'engine'           => 'agy',
+    ];
+}
+
 /**
  * Bytes de un JPEG 1×1 (dummy). Lo usa el modo $sinImagen: agy exige un
  * image.jpg copiable en su sandbox aunque el prompt no lo referencie (postproceso
