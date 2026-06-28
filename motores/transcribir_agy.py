@@ -1886,6 +1886,45 @@ def main() -> int:
     # ESTE job, nunca una vieja (fix freeze 2026-06-25).
     _stagear_en_scratch(_scratch_dir, sandbox_dir)
 
+    # ── Rutas absolutas para @imagen.jpg y @prompt.md (fix exploración 2026-06-28) ──
+    # La addenda agy en BD viene genérica (`@imagen.jpg`, `@prompt.md`), y agy en `-p`
+    # las resuelve de forma NO determinística: a veces cwd (=sandbox), a veces scratch,
+    # a veces "se va a explorar" con run_command (job 7123, Bump v12). Reemplazamos a
+    # rutas absolutas para que el modelo NO tenga que elegir dónde buscar — el path
+    # absoluto al sandbox es trusted (vía trustedWorkspaces), agy hace view_file
+    # directo. Reemplazamos en TRES lugares:
+    #   1) prompt.md del sandbox (lo lee agy desde el cwd).
+    #   2) prompt.md del scratch (la copia que stagea _stagear_en_scratch).
+    #   3) args.cmd_i (el comando que pasa lib_agy.php a agy con la mención a
+    #      @prompt.md o @imagen.jpg).
+    # Path absoluto = sandbox_dir.resolve() (distinto en PC vs laptop; por eso no
+    # podemos hardcodear en la addenda de BD).
+    try:
+        abs_sandbox = str(sandbox_dir.resolve())
+        ref_imagen  = f"@{abs_sandbox}{os.sep}imagen.jpg"
+        ref_prompt  = f"@{abs_sandbox}{os.sep}prompt.md"
+
+        prompt_disk = sandbox_dir / "prompt.md"
+        contenido = prompt_disk.read_text(encoding="utf-8")
+        contenido = contenido.replace("@imagen.jpg", ref_imagen)
+        contenido = contenido.replace("@prompt.md",  ref_prompt)
+        prompt_disk.write_text(contenido, encoding="utf-8")
+
+        if _scratch_dir is not None and (_scratch_dir / "prompt.md").exists():
+            try:
+                (_scratch_dir / "prompt.md").write_text(contenido, encoding="utf-8")
+            except Exception as e:
+                sys.stderr.write(f"[agy] WARN no pude reescribir scratch prompt.md: {e}\n")
+
+        args.cmd_i = args.cmd_i.replace("@imagen.jpg", ref_imagen) \
+                               .replace("@prompt.md",  ref_prompt)
+    except Exception as e:
+        # Best-effort: si el reemplazo falla por alguna razón (archivo locked,
+        # permisos), seguimos con las refs genéricas. agy a lo sumo cae al
+        # comportamiento histórico (resolución no determinística por el scratch
+        # resolver), que sigue cubierto por _limpiar_estado_agy + _stagear_en_scratch.
+        sys.stderr.write(f"[agy] WARN no pude reescribir refs absolutas: {e}\n")
+
     # ── Modelo global (NO-OP si --modelo-agy vacío) ──
     err_mod = setear_modelo_global(home_dir, args.modelo_agy)
     if err_mod:
