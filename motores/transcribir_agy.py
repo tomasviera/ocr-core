@@ -23,13 +23,12 @@ Lo invoca PHP (`web/includes/lib_agy.php`) desde un sandbox PRE-TRUSTED en
       [--home-dir C:/Users/Tomas/.gemini] \\
       [--modelo-agy "Gemini 3.5 Flash (Low)"] \\
       [--timeout 300] \\
-      [--cmd-mode interactive|print]   # print = -p (markdown crudo, sin inflar tablas) \\
-      [--debug-capture-ok]             # también vuelca bundle en OK (testing).
+      [--cmd-mode interactive|print]   # print = -p (markdown crudo, sin inflar tablas)
 
 El bundle forense (`console_raw`, `history_text`, `extracted_*`, `metrics.json`,
-`agy_logfile.log`) SIEMPRE se escribe en `<workdir_efímero>/debug/` cuando
-`ok=False`; con `--debug-capture-ok` también se vuelca en OK. PHP decide qué
-hacer con el workdir post-corrida (borrar / mover a archive_dir).
+`agy_logfile.log`) se escribe SIEMPRE en `<workdir_efímero>/debug/`, ok o !ok.
+El workdir queda intacto al terminar el subprocess; el caller PHP decide después
+(post-QA) si borrarlo o moverlo a un archive_dir.
 
 Filosofía one-shot estricta (plan §"Cambios por archivo"):
   - UNA transcripción y nada más. Toda la política de error / reintento /
@@ -997,22 +996,20 @@ def main_usage(args, t0_total: float) -> int:
         sys.stderr.write(traceback.format_exc())
         return 4
 
-    # Debug dump: siempre en fallo; en OK sólo con --debug-capture-ok (testing).
-    # Mismo modelo que main() — PHP decide conservar / borrar el workdir.
-    if (not out["ok"]) or args.debug_capture_ok:
-        try:
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            (debug_dir / "usage_snapshot.txt").write_text(out["raw_screen"], encoding='utf-8')
-            (debug_dir / "usage_history.txt").write_text(cap.get("history", ""), encoding='utf-8')
-            (debug_dir / "usage_raw.txt").write_text(cap.get("raw", ""), encoding='utf-8', errors='replace')
-            (debug_dir / "usage_metrics.json").write_text(json.dumps({
-                "ok": out["ok"], "veredicto": out["veredicto"], "estado": out["estado_captura"],
-                "bytes_total": out["bytes_total"], "duracion_seg": out["duracion_seg"],
-                "ready_ok": out["ready_ok"], "post_ok": out["post_ok"],
-                "error": out["error"], "parser_notes": out["parser_notes"],
-            }, indent=2, ensure_ascii=False), encoding='utf-8')
-        except Exception as _e:
-            sys.stderr.write(f"[agy-usage] WARN debug dump: {_e}\n")
+    # Debug dump: SIEMPRE (v18+). Mismo modelo que main() — PHP decide post-QA.
+    try:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / "usage_snapshot.txt").write_text(out["raw_screen"], encoding='utf-8')
+        (debug_dir / "usage_history.txt").write_text(cap.get("history", ""), encoding='utf-8')
+        (debug_dir / "usage_raw.txt").write_text(cap.get("raw", ""), encoding='utf-8', errors='replace')
+        (debug_dir / "usage_metrics.json").write_text(json.dumps({
+            "ok": out["ok"], "veredicto": out["veredicto"], "estado": out["estado_captura"],
+            "bytes_total": out["bytes_total"], "duracion_seg": out["duracion_seg"],
+            "ready_ok": out["ready_ok"], "post_ok": out["post_ok"],
+            "error": out["error"], "parser_notes": out["parser_notes"],
+        }, indent=2, ensure_ascii=False), encoding='utf-8')
+    except Exception as _e:
+        sys.stderr.write(f"[agy-usage] WARN debug dump: {_e}\n")
 
     sys.stderr.write(
         f"[agy-usage] veredicto={out['veredicto']} ok={out['ok']} "
@@ -1493,8 +1490,8 @@ def volcar_debug_bundle(debug_dir: Path, res: CaptureResult, metrics: dict,
                         agy_log_path: Optional[Path]) -> None:
     """Vuelca el bundle .txt del smoke al `debug_dir` (`<workdir>/debug/`).
 
-    El caller (main / main_usage) condiciona la llamada a `not ok or
-    args.debug_capture_ok`. Acá asumimos que la decisión ya está tomada.
+    v18+: el caller (main / main_usage) llama esto SIEMPRE; el lifecycle
+    del workdir (borrar / archivar) lo decide PHP post-QA.
     """
     try:
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -1765,10 +1762,8 @@ def parse_args():
                         "(p.ej. familia `[tipo:]` de manuscritos-v3). Mientras agy "
                         "trabaja el spinner del TUI emite bytes, así que este "
                         "fallback no dispara prematuramente.")
-    p.add_argument("--debug-capture-ok", action="store_true", dest="debug_capture_ok",
-                   help="Si está, vuelca el bundle forense también en OK "
-                        "(testing). Por default sólo se vuelca cuando ok=False; "
-                        "PHP setea esta flag cuando system_flags.agy_debug_capture='on'.")
+    # (v18+: el bundle se vuelca siempre, no hay flag de gating. El lifecycle
+    # del workdir lo decide PHP post-QA.)
     p.add_argument("--launch-mode", default="conpty", dest="launch_mode",
                    choices=["conpty"],
                    help="Modo de captura. Solo 'conpty' por ahora (plan B output.txt "
@@ -1817,9 +1812,9 @@ def main() -> int:
     salida_json = Path(args.salida_json).resolve()
     sandbox_dir = Path(args.sandbox_dir).resolve()
     home_dir = Path(args.home_dir).resolve() if args.home_dir else None
-    # Bundle forense: siempre dentro del workdir efímero (la mkdir se hace abajo
-    # antes de lanzar agy, junto con `--log-file`). El volcado se condiciona
-    # post-corrida a `not out["ok"]` o `args.debug_capture_ok`.
+    # Bundle forense: SIEMPRE dentro del workdir efímero (la mkdir se hace abajo
+    # antes de lanzar agy, junto con `--log-file`). El lifecycle del workdir
+    # (borrar / archivar a OneDrive) lo decide PHP post-QA — v18+.
     debug_dir = salida_json.parent / "debug"
 
     # ── Pre-flight (escribe veredicto ERROR y exit 3 sin tocar agy) ──
@@ -2045,13 +2040,13 @@ def main() -> int:
         sys.stderr.write(traceback.format_exc())
         return 4
 
-    # ── Debug dump: siempre en fallo; en OK sólo con --debug-capture-ok (testing) ──
-    # El bundle va al workdir efímero (debug_dir = <workdir>/debug/); PHP
-    # decide si conservarlo (mover al archive_dir) o borrarlo con el workdir.
-    # Casos antes-subsumidos (todos cubiertos por `not out["ok"]`):
-    #   - exploracion_agy: shape_salida() override a ERROR → ok=False.
-    #   - agy_exit_sin_datos, timeout, spawn_fail, cuota, todo lo demás.
-    if (not out["ok"]) or args.debug_capture_ok:
+    # ── Debug dump: SIEMPRE (v18+) ──
+    # El bundle va al workdir efímero (debug_dir = <workdir>/debug/). PHP corre
+    # el QA post-corrida y decide ahí si borrar el workdir (ok + QA limpia) o
+    # archivarlo (!ok o cualquier qa_sospecha). El bundle también permite
+    # diagnosticar OKs sospechosos: SIN_FIN, EXPLORACION_AGY (subsume v13),
+    # CAPTURA_TIMEOUT, WEBSEARCH no esperado, etc.
+    if True:
         metrics = {
             "estado_captura": res.estado,
             "fin_visto": res.fin_visto,
