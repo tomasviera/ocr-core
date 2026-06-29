@@ -36,6 +36,14 @@
  *   - agyBorrarWorkdir(string): bool        Borra workdir efímero del wrapper
  *   - agyLimpiarWorkdirsHuerfanos(...): int GC defensivo de <base>/agy_subprocess/
  *   - ejecutarAgy(...): array               Equivalente a ejecutarAiStudio()
+ *
+ * Política de archivado (v17+): el bundle forense vive SIEMPRE dentro del workdir
+ * efímero (`<workdir>/debug/`). En `ok=False` (o `debug_capture_ok` para testing)
+ * el workdir entero — bundle incluido — se MUEVE a `workdir_archive_dir` si el
+ * caller lo setea. Patrón Tier 3: workdir local rápido + archivo de fallos en
+ * OneDrive, visible desde la otra máquina. Si no se setea `workdir_archive_dir`,
+ * el conservado queda en local (compat). El `.py` lanza siempre `--log-file` al
+ * `<workdir>/debug/agy_logfile.log`.
  */
 
 declare(strict_types=1);
@@ -194,7 +202,7 @@ function _agyEjecutarUnIntento(
     int     $procTimeout,
     ?string $homeDir,
     ?string $modeloAgy,
-    ?string $debugDir,
+    bool    $debugCaptureOk,
     ?int    $cols,
     ?int    $rows,
     ?float  $grace,
@@ -218,9 +226,8 @@ function _agyEjecutarUnIntento(
         $cmd[] = '--modelo-agy';
         $cmd[] = $modeloAgy;
     }
-    if ($debugDir !== null && $debugDir !== '') {
-        $cmd[] = '--debug-dir';
-        $cmd[] = $debugDir;
+    if ($debugCaptureOk) {
+        $cmd[] = '--debug-capture-ok';
     }
     if ($cols !== null && $cols > 0) {
         $cmd[] = '--cols';
@@ -354,8 +361,18 @@ function _agyEjecutarUnIntento(
  *                                     'home_dir'              (opcional, v1 omitido)
  *                                     'modelo_agy'            (string mapeado por
  *                                                              agyMapearModelo)
- *                                     'debug_dir'             (opcional, gateado por
- *                                                              system_flags.agy_debug_capture)
+ *                                     'debug_capture_ok'      (bool, default false; si
+ *                                                              true vuelca bundle también
+ *                                                              en OK — testing. PHP lo
+ *                                                              setea con system_flags.agy_debug_capture)
+ *                                     'workdir_archive_dir'   (opcional: si se setea y
+ *                                                              el workdir se conserva
+ *                                                              (veredicto != OK o
+ *                                                              debug_capture_ok), se MUEVE
+ *                                                              ahí post-corrida. Típico:
+ *                                                              `WEB/temp/agy_debug/` en
+ *                                                              OneDrive — bundles forenses
+ *                                                              centralizados Tier 3)
  *                                     'workdir_base'          (opcional: base del
  *                                                              workdir efímero; si
  *                                                              falta cae a $resultadosDir
@@ -392,8 +409,9 @@ function ejecutarAgy(
     $homeDir    = isset($agyConfig['home_dir']) && $agyConfig['home_dir'] !== ''
                     ? (string)$agyConfig['home_dir'] : null;
     $modeloAgy  = isset($agyConfig['modelo_agy']) ? (string)$agyConfig['modelo_agy'] : null;
-    $debugDir   = isset($agyConfig['debug_dir']) && $agyConfig['debug_dir'] !== ''
-                    ? (string)$agyConfig['debug_dir'] : null;
+    $debugCaptureOk = !empty($agyConfig['debug_capture_ok']);
+    $archiveDir = isset($agyConfig['workdir_archive_dir']) && $agyConfig['workdir_archive_dir'] !== ''
+                    ? (string)$agyConfig['workdir_archive_dir'] : null;
     $tResp      = (int)($agyConfig['timeout_respuesta_seg'] ?? $timeout);
     $cols       = isset($agyConfig['cols']) ? (int)$agyConfig['cols'] : null;
     $rows       = isset($agyConfig['rows']) ? (int)$agyConfig['rows'] : null;
@@ -482,10 +500,10 @@ function ejecutarAgy(
         return _agyShapeError("prompt_escritura_fallo: $promptPath", $t0Total);
     }
 
-    // Crear debug_dir si se pidió (es ahora cuando sabemos el ts del job).
-    if ($debugDir !== null) {
-        @mkdir($debugDir, 0755, true);
-    }
+    // Bundle forense: el .py lo escribe SIEMPRE dentro de $workdir/debug/ (incluye
+    // agy_logfile.log). Si la corrida falla — o si debug_capture_ok está on — el
+    // workdir entero se MUEVE a $archiveDir/<workdir_name>/ post-corrida, junto
+    // con el bundle. Ver "── 4 ──" abajo. PHP no precrea $archiveDir acá.
 
     $procTimeout = $tResp + 120; // margen para arranque ConPTY + barrido zombis
 
@@ -504,22 +522,95 @@ function ejecutarAgy(
         $pythonBin, $scriptPath,
         $imagenPath, $promptPath, $salidaJsonPath, $sandboxDir,
         $tResp, $procTimeout,
-        $homeDir, $modeloAgy, $debugDir,
+        $homeDir, $modeloAgy, $debugCaptureOk,
         $cols, $rows, $grace, $agyBin, $cmdI, $cmdMode
     );
 
     $data      = $resp['data'] ?? [];
     $veredicto = $data['veredicto'] ?? null;
 
-    // Conservar el workdir efímero para inspección en TODOS los casos salvo el
-    // éxito limpio. (Si --debug-dir vino seteado, el bundle forense .txt del .py
-    // ya queda aparte en debug_dir; el workdir guarda específicamente el
-    // salida.json + stdout/stderr.log del subprocess.)
+    // ── 4. Conservar / archivar el workdir ──
+    // Conservar = veredicto != OK (siempre forense) o debug_capture_ok (testing).
+    // Si conservamos y hay $archiveDir, MOVEMOS el workdir entero ahí — bundle
+    // forense incluido (lo escribió el .py dentro de $workdir/debug/). Patrón
+    // Tier 3: workdir efímero local rápido + archivo de fallos en OneDrive,
+    // visible desde la otra máquina.
     $cuota     = ($veredicto === 'CUOTA');
-    $conservar = ($veredicto !== 'OK') || ($debugDir !== null);
+    $conservar = ($veredicto !== 'OK') || $debugCaptureOk;
+    $sandboxPath = $workdir; // fallback si no movemos
+    if ($conservar && $archiveDir !== null) {
+        $movido = _agyMoverConservadoAArchive($workdir, $archiveDir);
+        if ($movido !== null) {
+            $sandboxPath = $movido;
+        }
+    }
 
-    return _agyShapeRespuesta($resp, $workdir, $intentos, $t0Total,
+    return _agyShapeRespuesta($resp, $sandboxPath, $intentos, $t0Total,
         conservarWorkdir: $conservar, cuotaAgotada: $cuota, erroresIntentos: []);
+}
+
+/**
+ * Mueve un workdir conservado a `<archiveDir>/<basename(workdir)>/`. Devuelve
+ * el path final o null si no se pudo mover (en cuyo caso el workdir queda
+ * intacto en su ubicación original; el caller usa eso como fallback).
+ *
+ * Si el destino ya existe (colisión de timestamp), se le agrega sufijo `_dupN`.
+ * Cross-volume safe: usa rename() si misma raíz, recursive copy + delete si no.
+ */
+function _agyMoverConservadoAArchive(string $workdir, string $archiveDir): ?string
+{
+    if (!is_dir($workdir)) return null;
+    if (!@mkdir($archiveDir, 0755, true) && !is_dir($archiveDir)) {
+        coreLog('agy', 'WARN', "archive_dir no se pudo crear: $archiveDir — workdir queda en local: $workdir", []);
+        return null;
+    }
+    $base = basename($workdir);
+    $dest = rtrim($archiveDir, DIRECTORY_SEPARATOR . '/') . DIRECTORY_SEPARATOR . $base;
+    $n = 1;
+    while (is_dir($dest)) {
+        $dest = rtrim($archiveDir, DIRECTORY_SEPARATOR . '/') . DIRECTORY_SEPARATOR . $base . "_dup{$n}";
+        if (++$n > 50) {
+            coreLog('agy', 'WARN', "archive: demasiadas colisiones para $base; queda en local", []);
+            return null;
+        }
+    }
+    // 1) Intento atómico mismo volumen.
+    if (@rename($workdir, $dest)) {
+        return $dest;
+    }
+    // 2) Cross-volume (típico Tier 3: local C:\ → OneDrive E:\): copy + delete.
+    if (!_agyCopiarDirRecursivo($workdir, $dest)) {
+        coreLog('agy', 'WARN', "archive: copia recursiva falló de $workdir a $dest — workdir queda en local", []);
+        @rmdir($dest); // limpiar parcial
+        return null;
+    }
+    // Borramos el original. Reusamos agyBorrarWorkdir (exige /agy_subprocess/ en
+    // el realpath, que se cumple porque $workdir sigue siendo el original).
+    if (!agyBorrarWorkdir($workdir)) {
+        coreLog('agy', 'WARN', "archive: copia OK pero no pude borrar el original $workdir — quedó duplicado", []);
+    }
+    return $dest;
+}
+
+/** Copia recursiva de directorio (cross-volume; usado por _agyMoverConservadoAArchive). */
+function _agyCopiarDirRecursivo(string $src, string $dst): bool
+{
+    if (!is_dir($src)) return false;
+    if (!@mkdir($dst, 0755, true) && !is_dir($dst)) return false;
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($src, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+    foreach ($it as $item) {
+        $rel = substr($item->getPathname(), strlen($src) + 1);
+        $target = $dst . DIRECTORY_SEPARATOR . $rel;
+        if ($item->isDir()) {
+            if (!@mkdir($target, 0755, true) && !is_dir($target)) return false;
+        } else {
+            if (!@copy($item->getPathname(), $target)) return false;
+        }
+    }
+    return true;
 }
 
 // =====================================================================
@@ -567,15 +658,18 @@ function ejecutarAgy(
  *                            + margen. Default 120.
  * @param ?string $workdirBase Base del workdir efímero del wrapper. Si null,
  *                             cae al sys temp.
- * @param ?string $debugDir   Si se pasa, el .py vuelca `usage_snapshot.txt` +
- *                            history + raw + metrics en ese dir.
+ * @param ?string $archiveDir  Si se setea Y la corrida falla (o
+ *                             $debugCaptureOk), el workdir se MUEVE ahí
+ *                             post-corrida (mismo patrón que ejecutarAgy).
+ * @param bool    $debugCaptureOk Si true, vuelca bundle también en OK (testing).
  */
 function chequearUsageAgy(
     string  $sandboxDir,
     ?string $homeDir   = null,
     int     $timeoutSeg = 120,
     ?string $workdirBase = null,
-    ?string $debugDir = null
+    ?string $archiveDir = null,
+    bool    $debugCaptureOk = false
 ): array {
     $t0Total = microtime(true);
 
@@ -607,10 +701,6 @@ function chequearUsageAgy(
     }
     $salidaJsonPath = $workdir . DIRECTORY_SEPARATOR . 'salida.json';
 
-    if ($debugDir !== null && $debugDir !== '') {
-        @mkdir($debugDir, 0755, true);
-    }
-
     coreLog('agy', 'INFO', "Chequeando cuota agy via /usage (sandbox={$sandboxDir})", [
         'sandbox_dir' => $sandboxDir, 'home_dir' => $homeDir, 'timeout' => $timeoutSeg,
     ]);
@@ -626,9 +716,8 @@ function chequearUsageAgy(
         $cmd[] = '--home-dir';
         $cmd[] = $homeDir;
     }
-    if ($debugDir !== null && $debugDir !== '') {
-        $cmd[] = '--debug-dir';
-        $cmd[] = $debugDir;
+    if ($debugCaptureOk) {
+        $cmd[] = '--debug-capture-ok';
     }
 
     $stdoutFile = $workdir . DIRECTORY_SEPARATOR . 'stdout.log';
@@ -696,10 +785,13 @@ function chequearUsageAgy(
     }
 
     // Conservar el workdir efímero salvo éxito limpio (mismo criterio que
-    // ejecutarAgy: deja la traza para auditar).
+    // ejecutarAgy). Si hay $archiveDir, lo movemos ahí para visibilidad Tier 3.
     $ok = !empty($data['ok']);
-    if ($ok && $debugDir === null) {
+    $conservar = (!$ok) || $debugCaptureOk;
+    if (!$conservar) {
         agyBorrarWorkdir($workdir);
+    } elseif ($archiveDir !== null) {
+        _agyMoverConservadoAArchive($workdir, $archiveDir);
     }
 
     return [

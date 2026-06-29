@@ -24,7 +24,12 @@ Lo invoca PHP (`web/includes/lib_agy.php`) desde un sandbox PRE-TRUSTED en
       [--modelo-agy "Gemini 3.5 Flash (Low)"] \\
       [--timeout 300] \\
       [--cmd-mode interactive|print]   # print = -p (markdown crudo, sin inflar tablas) \\
-      [--debug-dir temp/agy_debug/<job>_edi<edi>_p<pag>_<ts>]
+      [--debug-capture-ok]             # también vuelca bundle en OK (testing).
+
+El bundle forense (`console_raw`, `history_text`, `extracted_*`, `metrics.json`,
+`agy_logfile.log`) SIEMPRE se escribe en `<workdir_efímero>/debug/` cuando
+`ok=False`; con `--debug-capture-ok` también se vuelca en OK. PHP decide qué
+hacer con el workdir post-corrida (borrar / mover a archive_dir).
 
 Filosofía one-shot estricta (plan §"Cambios por archivo"):
   - UNA transcripción y nada más. Toda la política de error / reintento /
@@ -154,7 +159,7 @@ FIN_MARKER = "<<<FIN_TRANSCRIPCION>>>"
 MIN_CONTENT_LEN = 20
 
 # Cap del console_raw que se devuelve en `stdout_raw` (la DB no lo necesita
-# entero; el bundle .txt completo va a --debug-dir si está activo).
+# entero; el bundle .txt completo va a `<workdir>/debug/` cuando se vuelca).
 # Subido 2026-06-04 (plan #3 §6): el smoke fue 61 KB, pero thoughts del modelo
 # en consola podrían pasar de 100 KB.
 STDOUT_CAP = 256 * 1024  # 256 KiB
@@ -869,7 +874,8 @@ def main_usage(args, t0_total: float) -> int:
     salida_json = Path(args.salida_json).resolve()
     sandbox_dir = Path(args.sandbox_dir).resolve()
     home_dir = Path(args.home_dir).resolve() if args.home_dir else None
-    debug_dir = Path(args.debug_dir).resolve() if args.debug_dir else None
+    # Bundle forense (mismo modelo que main(): dentro del workdir efímero).
+    debug_dir = salida_json.parent / "debug"
 
     # Pre-flight mínimo: el sandbox debe existir (cwd del PTY).
     if not sandbox_dir.is_dir():
@@ -991,8 +997,9 @@ def main_usage(args, t0_total: float) -> int:
         sys.stderr.write(traceback.format_exc())
         return 4
 
-    # Debug dump opcional (mismo gesto que el path transcribir).
-    if debug_dir is not None:
+    # Debug dump: siempre en fallo; en OK sólo con --debug-capture-ok (testing).
+    # Mismo modelo que main() — PHP decide conservar / borrar el workdir.
+    if (not out["ok"]) or args.debug_capture_ok:
         try:
             debug_dir.mkdir(parents=True, exist_ok=True)
             (debug_dir / "usage_snapshot.txt").write_text(out["raw_screen"], encoding='utf-8')
@@ -1484,11 +1491,10 @@ def leer_token_usage(sandbox_dir: Path) -> dict:
 
 def volcar_debug_bundle(debug_dir: Path, res: CaptureResult, metrics: dict,
                         agy_log_path: Optional[Path]) -> None:
-    """Vuelca el bundle .txt del smoke al `debug_dir`.
+    """Vuelca el bundle .txt del smoke al `debug_dir` (`<workdir>/debug/`).
 
-    Gateado por --debug-dir en el CLI (que el worker pasa sólo si
-    system_flags.agy_debug_capture='on'). Si --debug-dir no se pasó, ESTA
-    función NO se llama y nada se escribe.
+    El caller (main / main_usage) condiciona la llamada a `not ok or
+    args.debug_capture_ok`. Acá asumimos que la decisión ya está tomada.
     """
     try:
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -1759,10 +1765,10 @@ def parse_args():
                         "(p.ej. familia `[tipo:]` de manuscritos-v3). Mientras agy "
                         "trabaja el spinner del TUI emite bytes, así que este "
                         "fallback no dispara prematuramente.")
-    p.add_argument("--debug-dir", default=None, dest="debug_dir",
-                   help="Si está, vuelca bundle .txt forense ahí (gateado por "
-                        "system_flags.agy_debug_capture='on'). Sin esta flag, "
-                        "no se escribe ningún .txt.")
+    p.add_argument("--debug-capture-ok", action="store_true", dest="debug_capture_ok",
+                   help="Si está, vuelca el bundle forense también en OK "
+                        "(testing). Por default sólo se vuelca cuando ok=False; "
+                        "PHP setea esta flag cuando system_flags.agy_debug_capture='on'.")
     p.add_argument("--launch-mode", default="conpty", dest="launch_mode",
                    choices=["conpty"],
                    help="Modo de captura. Solo 'conpty' por ahora (plan B output.txt "
@@ -1811,7 +1817,10 @@ def main() -> int:
     salida_json = Path(args.salida_json).resolve()
     sandbox_dir = Path(args.sandbox_dir).resolve()
     home_dir = Path(args.home_dir).resolve() if args.home_dir else None
-    debug_dir = Path(args.debug_dir).resolve() if args.debug_dir else None
+    # Bundle forense: siempre dentro del workdir efímero (la mkdir se hace abajo
+    # antes de lanzar agy, junto con `--log-file`). El volcado se condiciona
+    # post-corrida a `not out["ok"]` o `args.debug_capture_ok`.
+    debug_dir = salida_json.parent / "debug"
 
     # ── Pre-flight (escribe veredicto ERROR y exit 3 sin tocar agy) ──
     if not imagen.is_file():
@@ -1949,20 +1958,23 @@ def main() -> int:
     # idéntico. cmd_mode='interactive' (-i) es el legacy y el DEFAULT por compat
     # (transcriptor-manuscritos-v3 sigue en -i, no setea cmd_mode; prensa opta vía lib_agy).
     # Validado 2026-06-24: prensadelplata/WEB/temp/tests/2026-06-24_agy_print_{AB,C}.
-    # En modo debug volcamos el log de agy al debug_dir; sin debug no escribimos
-    # ningún log file extra (mantiene el sandbox limpio).
+    # `--log-file` de agy siempre activo: el logfile va al workdir efímero
+    # (descartable si OK; viaja al archive_dir si !OK). Más caro en disco local
+    # por job pero garantiza evidencia forense en TODOS los fallos sin depender
+    # de un flag externo (regla: persistir toda info útil de los casos que
+    # fallan, ver feedback memory + §"Bump v17" en motor_agy.md).
     agy_log_path: Optional[Path] = None
     if args.cmd_mode == "print":
         argv = [args.agy_bin, "-p", args.cmd_i, "--print-timeout", f"{int(args.timeout)}s"]
     else:
         argv = [args.agy_bin, "-i", args.cmd_i]
-    if debug_dir is not None:
-        try:
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            agy_log_path = debug_dir / "agy_logfile.log"
-            argv.extend(["--log-file", str(agy_log_path)])
-        except Exception as e:
-            sys.stderr.write(f"[agy] WARN no se pudo preparar debug_dir: {e}\n")
+    try:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        agy_log_path = debug_dir / "agy_logfile.log"
+        argv.extend(["--log-file", str(agy_log_path)])
+    except Exception as e:
+        sys.stderr.write(f"[agy] WARN no se pudo preparar debug_dir: {e}\n")
+        agy_log_path = None
 
     # ── Captura ──
     pids_prev = _pids_agy_actuales()
@@ -2033,33 +2045,13 @@ def main() -> int:
         sys.stderr.write(traceback.format_exc())
         return 4
 
-    # ── Forensics forzados para exploracion_agy ──
-    # Si el check de exploración disparó (shape_salida override a ERROR) y
-    # debug_dir está apagado, lo derivamos del salida_json para preservar
-    # el bundle igual. Caso raro pero crítico: si el check fuera falso
-    # positivo necesitamos la evidencia (history_text, console_raw, metrics,
-    # extracted_*) para auditarlo. Path análogo a worker.php:1640-1642
-    # (temp/agy_debug/<basename_del_workdir>). agy_log_path queda en None
-    # porque agy se lanzó sin --log-file (gateado por debug_dir al inicio);
-    # el resto del bundle SÍ se escribe desde `res` ya capturado.
-    if (debug_dir is None
-            and out.get("ok") is False
-            and "exploracion_agy" in (out.get("error") or "")):
-        try:
-            workdir_name = salida_json.parent.name
-            # salida_json = .../temp/agy_subprocess/<workdir>/salida.json
-            #            → .../temp/agy_debug/<workdir>/
-            debug_dir = salida_json.parent.parent.parent / "agy_debug" / workdir_name
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            sys.stderr.write(
-                f"[agy] forense exploracion_agy: debug_dir auto-forzado → {debug_dir}\n"
-            )
-        except Exception as e:
-            sys.stderr.write(f"[agy] WARN forense exploracion: no pude crear debug_dir: {e}\n")
-            debug_dir = None
-
-    # ── Debug dump (si --debug-dir o forensics auto-forzados) ──
-    if debug_dir is not None:
+    # ── Debug dump: siempre en fallo; en OK sólo con --debug-capture-ok (testing) ──
+    # El bundle va al workdir efímero (debug_dir = <workdir>/debug/); PHP
+    # decide si conservarlo (mover al archive_dir) o borrarlo con el workdir.
+    # Casos antes-subsumidos (todos cubiertos por `not out["ok"]`):
+    #   - exploracion_agy: shape_salida() override a ERROR → ok=False.
+    #   - agy_exit_sin_datos, timeout, spawn_fail, cuota, todo lo demás.
+    if (not out["ok"]) or args.debug_capture_ok:
         metrics = {
             "estado_captura": res.estado,
             "fin_visto": res.fin_visto,

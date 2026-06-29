@@ -78,7 +78,8 @@ ejecutarAgy(
 | `sandbox_dir` | string | **sí** | sandbox PRE-TRUSTED del slot (cwd de agy) |
 | `home_dir` | string | no | override de HOME (lee/escribe `~/.gemini` de acá) |
 | `modelo_agy` | string | no | modelo exacto para `settings.json["model"]` |
-| `debug_dir` | string | no | si está, vuelca bundle forense (gateado por flag) |
+| `debug_capture_ok` | bool | no | v17+: si true, vuelca bundle forense también en OK (testing). Por default sólo se vuelca en !OK. |
+| `workdir_archive_dir` | string | no | v17+: si se setea y la corrida se conserva (!OK o `debug_capture_ok`), el workdir entero se MUEVE ahí — bundle forense incluido. Patrón Tier 3: local rápido + archivo en OneDrive. |
 | `workdir_base` | string | no | base del workdir efímero del wrapper; si falta cae a `$resultadosDir` y luego a `sys_get_temp_dir()` (se cuelga `agy_subprocess/`) |
 | `timeout_respuesta_seg` | int | no | default = `$timeout` |
 | `cols` | int | no | columnas del pseudo-terminal (default 2000) |
@@ -99,7 +100,9 @@ ejecutarAgy(
 --cols          (opt, def 2000)  columnas del pseudo-terminal
 --rows          (opt, def 100)   filas
 --grace         (opt, def 5.0)   segundos de estabilidad tras candidato
---debug-dir     (opt)  vuelca bundle .txt forense ahí
+--debug-capture-ok (opt, v17+) vuelca bundle también en OK (testing).
+                              Por default sólo se vuelca en !OK. El bundle siempre
+                              va a `<workdir_efímero>/debug/`.
 --launch-mode   (opt, def conpty)  solo 'conpty' por ahora
 --agy-bin       (opt, def agy)   ejecutable de agy
 ```
@@ -289,8 +292,8 @@ function coreLogSink($engine, $nivel, $msg, $detalle) { logEvento($engine, $nive
 
 **Lo que NO pasa por `coreLog`:** la *persistencia de dominio*
 (`registrarLlamada` / `guardarTranscripcionRaw` / `parseAndInsertEntradas`) la hace
-el worker. El *debug de modo-prueba a filesystem* (`--debug-dir`) lo escribe el `.py`;
-lo importante siempre va a DB en el worker.
+el worker. El *bundle forense* (v17+: `<workdir>/debug/`) lo escribe el `.py` en
+todo fallo; lo importante siempre va a DB en el worker.
 
 ---
 
