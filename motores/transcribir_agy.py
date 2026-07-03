@@ -335,6 +335,13 @@ class CaptureResult:
     # CUOTA y shape_salida marca `cuota_agotada=true`.
     cuota_detectada: bool = False
     cuota_reset_seg: Optional[int] = None  # parseado de "Resets in 13m27s"; None si no se pudo
+    # Fallo de ARRANQUE anterior a cualquier llamado de generación al LLM (ver
+    # _detectar_arranque_transitorio). Si True, agy murió antes de invocar el
+    # endpoint `streamGenerateContent` (backend 500 al resolver modelo, keyring
+    # /auth timeout, etc.) → NO consumió cuota → decidir_veredicto retorna
+    # TRANSITORIO y el worker lo reintenta (cap) en vez de fail-fast a ERROR.
+    transitorio_detectado: bool = False
+    transitorio_motivo: str = ""
 
 
 def capturar(
@@ -1407,6 +1414,56 @@ def _detectar_cuota_en_conversacion(conv_dir: str, t_launch: float) -> tuple:
     return (False, None)
 
 
+# Firmas de fallo de ARRANQUE de agy anteriores a cualquier generación (cada
+# una muere antes de llamar al endpoint `streamGenerateContent` → NO consume
+# cuota agy). El texto vive en el `--log-file` de agy y/o en la consola (pyte).
+# Agregar una firma nueva acá alcanza para que el worker la reintente.
+# Casos observados (agy_debug 2026-06-28..07-02): cluster A (backend 500 al
+# bajar la lista de modelos → no resuelve el override → "neither PlanModel…"),
+# cluster C (Credential Manager no responde en 5s → cae a OAuth interactivo →
+# "authentication timed out"). NO incluye la exploración (cluster B): esa SÍ
+# llega a generar (streamGenerateContent) → se queda ERROR y conserva el debug.
+_FIRMAS_ARRANQUE_TRANSITORIO = (
+    ("neither planmodel nor requestedmodel", "modelo_no_resuelto_backend"),
+    ("failed to retrieve user quota summary", "quota_summary_500"),
+    ("internal (code 500)",                   "backend_500_code_assist"),
+    ("authentication timed out",              "auth_timeout"),
+    ("authentication failed or timed out",    "auth_timeout"),
+    ("keyringauth: timed out",                "keyring_timeout"),
+)
+# Endpoint de GENERACIÓN. Si aparece en el log, agy llamó al LLM → hubo posible
+# consumo de cuota → NO es reintento seguro (gate duro de la regla de Tomás:
+# "reintentar sólo lo que falla ANTES de que agy haga llamados al LLM").
+_MARCA_GENERACION = "streamgeneratecontent"
+
+
+def _detectar_arranque_transitorio(res: "CaptureResult",
+                                   agy_log_path) -> tuple:
+    """¿El fallo fue de ARRANQUE, anterior a cualquier generación (→ sin cuota
+    consumida → reintentable)? Devuelve (True, motivo) sólo si (a) NO hubo
+    `streamGenerateContent` en el log (gate duro) y (b) matchea una firma
+    pre-LLM conocida. Best-effort: ante cualquier duda (log ilegible, sin firma,
+    hubo generación) → (False, "") = se mantiene ERROR fail-fast (conserva
+    debug, re-encolado manual = status quo). Nunca marca transitorio un job que
+    llegó a llamar al LLM."""
+    console = (res.console_raw or "").lower()
+    log_txt = ""
+    try:
+        if agy_log_path and Path(agy_log_path).is_file():
+            log_txt = Path(agy_log_path).read_text(
+                encoding="utf-8", errors="replace").lower()
+    except Exception:
+        log_txt = ""  # logfile lockeado/ausente → gate no verificable → conservador
+    # Gate duro: si agy llegó a generar, NO es reintentable (posible cuota).
+    if _MARCA_GENERACION in log_txt:
+        return (False, "")
+    blob = console + "\n" + log_txt
+    for needle, motivo in _FIRMAS_ARRANQUE_TRANSITORIO:
+        if needle in blob:
+            return (True, motivo)
+    return (False, "")
+
+
 # ============================================================
 # TOKEN USAGE — side-channel statusLine (plan #3 §5)
 # ============================================================
@@ -1586,6 +1643,19 @@ def decidir_veredicto(res: CaptureResult) -> tuple:
     if screen and len(screen) >= MIN_CONTENT_LEN:
         return ("OK", screen, None, False, "screen")
 
+    # 3.5) Fallo de ARRANQUE transitorio (pre-generación → sin cuota consumida):
+    #      backend 500 al resolver el modelo, auth/keyring timeout, etc. Sólo
+    #      llega acá si NO hubo response utilizable (agy murió antes de
+    #      transcribir). El gate duro (sin `streamGenerateContent`) ya se validó
+    #      en _detectar_arranque_transitorio. El worker lo reintenta (cap) en
+    #      vez de fail-fast a ERROR; si agotó el cap, cae a ERROR terminal.
+    if getattr(res, "transitorio_detectado", False):
+        return ("TRANSITORIO", "",
+                (f"arranque_transitorio: {res.transitorio_motivo or 'pre_generacion'} "
+                 f"(agy no llegó a generar → sin cuota consumida) "
+                 f"[estado={res.estado} exit={res.exitstatus}]"),
+                False, "vacio")
+
     # 4) Genuino fallo: nada utilizable en el grid.
     err_parts = []
     if res.estado == "TIMEOUT":
@@ -1688,6 +1758,10 @@ def shape_salida(
         # 429 de la .db). 0 si no se pudo parsear o no aplica → el worker usará
         # el default `agy_cooldown_seg` como fallback.
         "cuota_reset_seg": int(getattr(res, "cuota_reset_seg", 0) or 0),
+        # Motivo del fallo de arranque transitorio (pre-generación) cuando
+        # veredicto==TRANSITORIO; "" si no aplica. Forense (viaja al bundle
+        # debug). El worker rutea el reintento por veredicto, no por este campo.
+        "transitorio_motivo": str(getattr(res, "transitorio_motivo", "") or ""),
         # Extras agy (consumidos por lib_agy.php + worker)
         "fuente_response": fuente_response,
         "fin_presente": bool(fin_presente),
@@ -2015,6 +2089,24 @@ def main() -> int:
             )
     except Exception as _e:
         sys.stderr.write(f"[agy] WARN _detectar_cuota_en_conversacion: {_e}\n")
+
+    # ── Detección de fallo de arranque transitorio (pre-generación) ──
+    # Si agy murió antes de llamar al LLM (backend 500 al resolver modelo,
+    # auth/keyring timeout, etc.) NO consumió cuota → el worker lo reintenta
+    # (cap) en vez de fail-fast a ERROR. Gate duro dentro del helper: si hubo
+    # `streamGenerateContent`, NO es transitorio (posible cuota → ERROR). No
+    # aplica si ya se detectó cuota (decidir_veredicto prioriza CUOTA).
+    try:
+        _trans, _motivo = _detectar_arranque_transitorio(res, agy_log_path)
+        if _trans:
+            res.transitorio_detectado = True
+            res.transitorio_motivo = _motivo
+            sys.stderr.write(
+                f"[agy] arranque_transitorio detectado (motivo={_motivo}) "
+                f"— sin generación → reintentable\n"
+            )
+    except Exception as _e:
+        sys.stderr.write(f"[agy] WARN _detectar_arranque_transitorio: {_e}\n")
 
     # ── Parseo estructurado de tools del TUI (plan #3 §4) ──
     tools_used = parsear_tool_calls(res.history_text or "")

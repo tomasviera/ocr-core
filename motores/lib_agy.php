@@ -938,6 +938,10 @@ function _agyShapeRespuesta(
     // la .db de la conversación). 0 si no se pudo parsear → el worker usará el
     // default `agy_cooldown_seg` como fallback.
     if (isset($data['cuota_reset_seg']))     $extras['cuota_reset_seg']          = (int) $data['cuota_reset_seg'];
+    // Motivo del fallo de arranque transitorio (veredicto=TRANSITORIO): backend
+    // 500 al resolver modelo, auth/keyring timeout, etc. El worker rutea el
+    // reintento por `veredicto`; este campo es para el error_msg/forense.
+    if (isset($data['transitorio_motivo']))  $extras['transitorio_motivo']       = (string) $data['transitorio_motivo'];
 
     // Token usage del statusLine side-channel (leído por el .py tras cerrar agy).
     // Si el setup manual del statusLine no se hizo, todos quedan en 0. A
