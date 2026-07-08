@@ -570,13 +570,19 @@ USAGE_READY_TIMEOUT_SEG   = 90.0
 USAGE_POST_QUIESCENT_SEG  = 5.0
 USAGE_POST_TIMEOUT_SEG    = 45.0
 
-# Regex para el texto "35% remaining · Refreshes in 125h 28m" o "Quota available".
-# Tomás decidió 2026-06-27 NO parsear el bar (decisión menos frágil): el texto
-# del header trae el dato remaining entero + la ventana al reset legible.
-# Granularidad 1% alcanza para el umbral de pausa (default 90%).
+# Regex del header "35% remaining · Refreshes in 125h 28m" (para reset_seg) y
+# del bar `[███░░░...] 5.65%` (para el pct con decimales). Historia:
+#   2026-06-27: parseo del header sólo. Granularidad 1% alcanzaba para el
+#     umbral de pausa (90%).
+#   v20 (2026-07-08): el header redondea a entero y perdemos precisión visible
+#     ("6% remaining" cuando el bar dice 5.65%). Ahora el bar manda para el
+#     pct (2 decimales), el header sigue mandando para reset_seg + fallback si
+#     el bar no matcheara. Ver notas/motor_agy.md §"Bump v20".
 _USAGE_REMAINING_RE = re.compile(
     r"(?P<rem>\d+)%\s+remaining\s*·\s*Refreshes\s+in\s+"
     r"(?:(?P<h>\d+)h\s*)?(?:(?P<m>\d+)m)?", re.IGNORECASE)
+_USAGE_BAR_RE = re.compile(
+    r"\]\s+(?P<rem>\d+(?:\.\d+)?)\s*%", re.IGNORECASE)
 _USAGE_QUOTA_AVAILABLE_RE = re.compile(r"\bQuota\s+available\b", re.IGNORECASE)
 # El bloque GEMINI MODELS está delimitado por su header. El siguiente bloque
 # ("CLAUDE AND GPT MODELS") corta el alcance del parser para no mezclarlos.
@@ -596,20 +602,32 @@ _USAGE_PLAN_RE = re.compile(
 
 def _parse_usage_segmento(seg_text: str) -> tuple:
     """Parsea un segmento (Weekly o Five Hour) y devuelve (pct_usado, reset_seg)
-    o (None, None) si no se pudo parsear. Granularidad: 1% (entero); reset_seg
-    en segundos (=0 cuando dice "Quota available")."""
+    o (None, None) si no se pudo parsear. Granularidad: 0.01% (del bar); el
+    header redondea a entero. `reset_seg` en segundos (=0 cuando dice
+    "Quota available")."""
     if not seg_text:
         return (None, None)
     if _USAGE_QUOTA_AVAILABLE_RE.search(seg_text):
         return (0.0, 0)  # 100% remaining → 0% usado, reset_seg = 0
-    m = _USAGE_REMAINING_RE.search(seg_text)
-    if not m:
+
+    # pct: bar (con decimales) prevalece; header (entero) es fallback.
+    bar_m = _USAGE_BAR_RE.search(seg_text)
+    hdr_m = _USAGE_REMAINING_RE.search(seg_text)
+    if bar_m is not None:
+        rem = float(bar_m.group("rem"))
+    elif hdr_m is not None:
+        rem = float(hdr_m.group("rem"))
+    else:
         return (None, None)
-    rem = int(m.group("rem"))
-    pct_usado = max(0.0, min(100.0, 100.0 - float(rem)))
-    horas = int(m.group("h") or 0)
-    mins  = int(m.group("m") or 0)
-    reset_seg = horas * 3600 + mins * 60
+    pct_usado = max(0.0, min(100.0, 100.0 - rem))
+
+    # reset_seg: sólo del header. Si el header no matcheó, dejamos None
+    # (el UPSERT PHP lo persiste como weekly_reset_at=NULL).
+    reset_seg = None
+    if hdr_m is not None:
+        horas = int(hdr_m.group("h") or 0)
+        mins  = int(hdr_m.group("m") or 0)
+        reset_seg = horas * 3600 + mins * 60
     return (pct_usado, reset_seg)
 
 
