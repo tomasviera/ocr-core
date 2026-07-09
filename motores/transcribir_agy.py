@@ -578,8 +578,14 @@ USAGE_POST_TIMEOUT_SEG    = 45.0
 #     ("6% remaining" cuando el bar dice 5.65%). Ahora el bar manda para el
 #     pct (2 decimales), el header sigue mandando para reset_seg + fallback si
 #     el bar no matcheara. Ver notas/motor_agy.md §"Bump v20".
+#   v21 (2026-07-09): al 100% weekly usado, el TUI OMITE el prefijo
+#     "X% remaining · " y emite sólo "Refreshes in 95h 23m" en la línea del
+#     header → el regex previo fallaba y `weekly_reset_seg` quedaba None (DB
+#     grababa NULL). Hacemos opcional el prefijo `(\d+)% remaining · ` y el
+#     fallback de pct por header queda condicionado a que `rem` haya matcheado.
+#     Ver notas/motor_agy.md §"Bump v21".
 _USAGE_REMAINING_RE = re.compile(
-    r"(?P<rem>\d+)%\s+remaining\s*·\s*Refreshes\s+in\s+"
+    r"(?:(?P<rem>\d+)%\s+remaining\s*·\s*)?Refreshes\s+in\s+"
     r"(?:(?P<h>\d+)h\s*)?(?:(?P<m>\d+)m)?", re.IGNORECASE)
 _USAGE_BAR_RE = re.compile(
     r"\]\s+(?P<rem>\d+(?:\.\d+)?)\s*%", re.IGNORECASE)
@@ -611,12 +617,16 @@ def _parse_usage_segmento(seg_text: str) -> tuple:
         return (0.0, 0)  # 100% remaining → 0% usado, reset_seg = 0
 
     # pct: bar (con decimales) prevalece; header (entero) es fallback.
+    # v21: el header ahora puede matchear SIN el grupo `rem` (caso 100% weekly:
+    # el TUI emite sólo "Refreshes in 95h 23m"). En ese caso el header sigue
+    # sirviendo para `reset_seg` abajo, pero NO para `pct`.
     bar_m = _USAGE_BAR_RE.search(seg_text)
     hdr_m = _USAGE_REMAINING_RE.search(seg_text)
+    hdr_rem_str = hdr_m.group("rem") if hdr_m is not None else None
     if bar_m is not None:
         rem = float(bar_m.group("rem"))
-    elif hdr_m is not None:
-        rem = float(hdr_m.group("rem"))
+    elif hdr_rem_str is not None:
+        rem = float(hdr_rem_str)
     else:
         return (None, None)
     pct_usado = max(0.0, min(100.0, 100.0 - rem))
