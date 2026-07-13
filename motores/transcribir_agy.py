@@ -1526,6 +1526,12 @@ def leer_token_usage(sandbox_dir: Path) -> dict:
         "tokens_thought": 0, "tokens_total": 0,
         "context_window_size": 0, "used_percentage": 0.0, "plan_tier": "",
         "statusline_disponible": False,
+        # Cuota del bloque `quota` del statusLine (gemini-weekly / gemini-5h).
+        # None = no vino el dato (sin statusLine, o shape sin `quota`) → el
+        # consumidor PHP gatea con !== null y NO toca cuota. 0.0 sería "0% usado".
+        "quota_weekly_pct_usado": None, "quota_weekly_reset_seg": None,
+        "quota_h5_pct_usado": None, "quota_h5_reset_seg": None,
+        "account_email": None,
     }
     path = sandbox_dir / ".agy_last_status.json"
     if not path.is_file():
@@ -1564,6 +1570,32 @@ def leer_token_usage(sandbox_dir: Path) -> dict:
     out["used_percentage"]     = _f(cw.get("used_percentage"))
     out["plan_tier"]           = str(data.get("plan_tier") or "")
     out["statusline_disponible"] = True
+
+    # Cuota (bloque `quota`): sólo el grupo GEMINI que consume prensa
+    # (gemini-weekly/gemini-5h; las `3p-*` son de Antigravity, no las usamos).
+    # `remaining_fraction` (0..1) → pct USADO = round((1-frac)*100, 2); el mismo
+    # shape que produce parsear_usage_screen para el /usage, así el feed en PHP
+    # no discrimina origen. Defensivo con .get() y `if key in`: campo faltante
+    # queda en None (base dict), degradación limpia.
+    q = data.get("quota") or {}
+    gw = (q.get("gemini-weekly") or {}) if isinstance(q, dict) else {}
+    g5 = (q.get("gemini-5h") or {}) if isinstance(q, dict) else {}
+
+    def _pct_usado(frac):
+        try:
+            return round((1.0 - float(frac)) * 100.0, 2)
+        except Exception:
+            return None
+
+    if "remaining_fraction" in gw:
+        out["quota_weekly_pct_usado"] = _pct_usado(gw.get("remaining_fraction"))
+    if "reset_in_seconds" in gw:
+        out["quota_weekly_reset_seg"] = _i(gw.get("reset_in_seconds"))
+    if "remaining_fraction" in g5:
+        out["quota_h5_pct_usado"] = _pct_usado(g5.get("remaining_fraction"))
+    if "reset_in_seconds" in g5:
+        out["quota_h5_reset_seg"] = _i(g5.get("reset_in_seconds"))
+    out["account_email"] = str(data.get("email") or "") or None
     return out
 
 
@@ -1809,6 +1841,13 @@ def shape_salida(
         "context_window_size": int(tokens.get("context_window_size", 0)),
         "used_percentage": float(tokens.get("used_percentage", 0.0)),
         "plan_tier": str(tokens.get("plan_tier", "")),
+        # Cuota en tiempo real desde el statusLine (feed que reemplaza el
+        # agy_usage_check scheduled). None si no vino → PHP gatea !== null.
+        "quota_weekly_pct_usado": tokens.get("quota_weekly_pct_usado"),
+        "quota_weekly_reset_seg": tokens.get("quota_weekly_reset_seg"),
+        "quota_h5_pct_usado":     tokens.get("quota_h5_pct_usado"),
+        "quota_h5_reset_seg":     tokens.get("quota_h5_reset_seg"),
+        "account_email":          tokens.get("account_email"),
         "fecha_iso": datetime.now().isoformat(timespec='seconds'),
     }
 

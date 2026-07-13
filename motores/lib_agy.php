@@ -934,6 +934,15 @@ function _agyShapeRespuesta(
     if (isset($data['context_window_size'])) $extras['context_window_size']      = (int)$data['context_window_size'];
     if (isset($data['used_percentage']))     $extras['used_percentage']          = (float)$data['used_percentage'];
     if (isset($data['plan_tier']))           $extras['plan_tier']                = $data['plan_tier'];
+    // Cuota en tiempo real del statusLine (bloque `quota` gemini-weekly/5h). Mismo
+    // shape que produce el /usage (`chequearUsageAgy`) para que el consumidor PHP
+    // (feed del worker) no discrimine origen. `null` — no 0/'' — cuando falta,
+    // para distinguir "no hay statusLine" de "0% usado"; el feed gatea con !== null.
+    $extras['weekly_pct_usado'] = isset($data['quota_weekly_pct_usado']) ? (float)$data['quota_weekly_pct_usado'] : null;
+    $extras['weekly_reset_seg'] = isset($data['quota_weekly_reset_seg']) ? (int)$data['quota_weekly_reset_seg'] : null;
+    $extras['h5_pct_usado']     = isset($data['quota_h5_pct_usado'])     ? (float)$data['quota_h5_pct_usado'] : null;
+    $extras['h5_reset_seg']     = isset($data['quota_h5_reset_seg'])     ? (int)$data['quota_h5_reset_seg'] : null;
+    $extras['account_email']    = $data['account_email'] ?? null;
     // Segundos hasta el reset de cuota (parseado del 429 "Resets in 13m27s" en
     // la .db de la conversación). 0 si no se pudo parsear → el worker usará el
     // default `agy_cooldown_seg` como fallback.
