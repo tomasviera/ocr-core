@@ -1481,6 +1481,8 @@ _TOOL_ACTION_RE = re.compile(r'"toolAction"\s*:\s*"([^"]+)"')
 # labels futuros o localizados).
 _TOOL_ACTION_TO_CANON = {
     "Viewing file":                    "view_file",
+    "Viewing prompt.md":               "view_file",   # skill agy-customizations (local)
+    "Viewing image":                   "view_file",   # skill agy-customizations (local)
     "Reading file":                    "read_file",
     "Reading prompt instructions":     "read_file",   # esperado en cada job (@prompt.md)
     "Viewing image for transcription": "view_file",   # esperado en cada job (@imagen.jpg)
@@ -1498,6 +1500,34 @@ _TOOL_ACTION_TO_CANON = {
     "Browsing":                        "browser",
     "Applying patch":                  "apply_patch",
 }
+# Regex para el UUID de la conversación de ESTA corrida: agy lo escribe en la
+# 1ª línea del --log-file ("Created conversation <uuid>"). Usarlo es 100%
+# determinístico — evita depender de heurísticas de mtime que fallan cuando
+# corren varias transcripciones en ventana chica (multi-host, o post-reinicio
+# del worker con .db abiertas por procesos zombie).
+_UUID_CONV_RE = re.compile(
+    r'Created conversation ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+    re.IGNORECASE,
+)
+
+
+def _uuid_conversacion_desde_log(agy_log_path) -> Optional[str]:
+    """Extrae el UUID de la conversación del `agy_logfile.log` de ESTA corrida.
+    Determinístico: agy escribe una línea `Created conversation <uuid>` cerca
+    del arranque. Best-effort: si el archivo no existe / está corrupto,
+    devuelve None y el detector cae al mecanismo heurístico (por mtime)."""
+    if not agy_log_path:
+        return None
+    try:
+        p = str(agy_log_path)
+        if not os.path.isfile(p):
+            return None
+        with open(p, encoding='utf-8', errors='replace') as f:
+            head = f.read(64 * 1024)  # el "Created conversation" cae en los 1ros KB
+        m = _UUID_CONV_RE.search(head)
+        return m.group(1) if m else None
+    except Exception:
+        return None
 # Set canónico de tools que se consideran "web" (para poblar el bit
 # websearch_detectado). Grounding server-side es aparte (via _DB_WEB_MARKERS).
 _DB_WEB_TOOL_NAMES = frozenset({
@@ -1522,36 +1552,36 @@ _URL_GOOGLE_HOSTS_SUFFIX = (
 _ARGS_JSON_RE = re.compile(r"\{[^{}]{2,600}\}")
 
 
-def _parsear_conversacion_db(conv_dir: str, t_launch: float) -> dict:
-    """Extrae tool calls + web signals de la .db de conversación de ESTE job.
+def _steps_a_strings(rows: list) -> list:
+    """Convierte las rows de la tabla `steps` a [(idx, blob_ascii_concat), ...].
+    Extrae strings ASCII imprimibles (regex `[\\x20-\\x7e]{4,}`) del BLOB
+    protobuf de cada step. Es el mismo gesto que `strings` de Unix — no
+    parsea el protobuf, sólo saca los strings legibles que quedaron
+    intercalados (nombres de tool, args JSON, URLs, etc.)."""
+    out = []
+    for row in rows:
+        idx = row[0]
+        parts = []
+        for b in row[1:]:
+            if b is None:
+                continue
+            if isinstance(b, str):
+                b = b.encode("utf-8", "replace")
+            parts += [m.group().decode("ascii", "replace")
+                      for m in _PRINTABLE.finditer(b)]
+        out.append((idx, "\n".join(parts)))
+    return out
 
-    Devuelve dict con:
-      - `db_path`     : path de la .db elegida (para copiar al bundle), o None
-      - `tool_calls`  : list[{"name":str,"args":str,"step_idx":int}] — 1 entrada
-                        por tool encontrada por step (deduplicada por (idx,name))
-      - `web_signals` : list[str] — patrones canónicos matcheados (`vertexaisearch`,
-                        `search_web`, `read_url_content`, URL host, etc.)
-      - `web_urls`    : list[str] — hosts URL http(s) no-google encontrados
 
-    Best-effort: cualquier excepción → dict con listas vacías y db_path=None.
-    Prioriza la .db con más steps (heurística: cuota va 1-2 steps, transcripción
-    directa 5-8, exploración/web ≥10).
-    """
-    out = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": []}
-    try:
-        dbs = [
-            p for p in glob.glob(os.path.join(conv_dir, "*.db"))
-            if os.path.getmtime(p) >= t_launch - 2
-        ]
-    except Exception:
-        return out
-    if not dbs:
-        return out
-
-    best = None  # (db_path, [(idx, printable_str), ...])
-    for db in sorted(dbs, key=os.path.getmtime, reverse=True)[:3]:
+def _leer_steps_db(db_path: str, retries: int = 3, sleep_s: float = 0.3) -> Optional[list]:
+    """Abre la .db en mode=ro y devuelve rows[(idx, payload, err)] o None.
+    Reintenta si sqlite3 falla con "database is locked" o "unable to open" —
+    agy puede tener la .db abierta (WAL activo) al momento del check y una
+    lectura ro con timeout=2 puede fallar la 1ª vez pero pasar la 2ª."""
+    last_err = None
+    for attempt in range(retries):
         try:
-            uri = "file:" + db.replace("\\", "/") + "?mode=ro"
+            uri = "file:" + db_path.replace("\\", "/") + "?mode=ro"
             con = sqlite3.connect(uri, uri=True, timeout=2)
             try:
                 try:
@@ -1562,36 +1592,82 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float) -> dict:
                     rows = con.execute(
                         "SELECT idx, step_payload FROM steps ORDER BY idx"
                     ).fetchall()
+                return rows
             finally:
                 con.close()
+        except Exception as e:
+            last_err = e
+            if attempt + 1 < retries:
+                time.sleep(sleep_s)
+    sys.stderr.write(f"[agy] WARN _leer_steps_db({os.path.basename(db_path)}) tras {retries} intentos: {last_err}\n")
+    return None
+
+
+def _parsear_conversacion_db(conv_dir: str, t_launch: float,
+                             uuid_conversacion: Optional[str] = None) -> dict:
+    """Extrae tool calls + web signals de la .db de conversación de ESTE job.
+
+    Prioridades para elegir la .db:
+      1) **`uuid_conversacion` explícito** — el UUID lo saca `main()` del
+         `agy_logfile.log` de ESTA corrida (línea `Created conversation <uuid>`).
+         Es determinístico → cero ambigüedad, cero riesgo de agarrar la .db
+         de una corrida concurrente en otro slot. **Es la vía preferida.**
+      2) Fallback heurístico por mtime: .db con `mtime >= t_launch - 2` de la
+         carpeta, procesadas por mtime desc (cap 10). Se elige la que más steps
+         tenga. Sólo aplica si (1) no dio resultado (log corrupto, agy no logueó
+         el UUID, etc.).
+
+    Retorna dict con:
+      - `db_path`     : path de la .db elegida (para copiar al bundle), o None
+      - `tool_calls`  : list[{"name":str,"args":str,"step_idx":int}]
+      - `web_signals` : list[str] — patrones canónicos matcheados
+      - `web_urls`    : list[str] — hosts URL http(s) no-google encontrados
+
+    Best-effort: cualquier excepción → dict con listas vacías y db_path=None.
+    """
+    out = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": []}
+
+    # ── Vía 1 (preferida): UUID exacto del logfile ──
+    steps_strings = None  # [(idx, printable_str_blob), ...]
+    chosen_db = None
+    if uuid_conversacion:
+        cand = os.path.join(conv_dir, f"{uuid_conversacion}.db")
+        if os.path.isfile(cand):
+            rows = _leer_steps_db(cand)
+            if rows is not None:
+                chosen_db = cand
+                steps_strings = _steps_a_strings(rows)
+
+    # ── Vía 2 (fallback): scan por mtime, elegir la de más steps ──
+    if steps_strings is None:
+        try:
+            dbs = [
+                p for p in glob.glob(os.path.join(conv_dir, "*.db"))
+                if os.path.getmtime(p) >= t_launch - 2
+            ]
         except Exception:
-            continue
+            return out
+        if not dbs:
+            return out
+        best = None  # (db_path, steps_strings)
+        for db in sorted(dbs, key=os.path.getmtime, reverse=True)[:10]:
+            rows = _leer_steps_db(db)
+            if rows is None:
+                continue
+            ss = _steps_a_strings(rows)
+            if best is None or len(ss) > len(best[1]):
+                best = (db, ss)
+        if best is None:
+            return out
+        chosen_db, steps_strings = best[0], best[1]
 
-        # Convertir cada step a un blob de strings ASCII imprimibles.
-        steps_strings = []  # [(idx, str_blob_concat)]
-        for row in rows:
-            idx = row[0]
-            parts = []
-            for b in row[1:]:
-                if b is None:
-                    continue
-                if isinstance(b, str):
-                    b = b.encode("utf-8", "replace")
-                parts += [m.group().decode("ascii", "replace")
-                          for m in _PRINTABLE.finditer(b)]
-            steps_strings.append((idx, "\n".join(parts)))
-        if best is None or len(steps_strings) > len(best[1]):
-            best = (db, steps_strings)
-
-    if best is None:
-        return out
-    out["db_path"] = best[0]
+    out["db_path"] = chosen_db
 
     seen_signals = set()
     seen_hosts = set()
     prev_call = None  # (canon_name, args_snippet_head) para dedupar plan+ejec
 
-    for idx, blob in best[1]:
+    for idx, blob in steps_strings:
         # Los tool calls reales de agy vienen SÓLO en "toolAction". Cada tool
         # aparece 2× (step "plan" con type=15 + step "ejec" con type≠15). No
         # tenemos el step_type acá — dedupamos por (canon, primeros 80 chars de
@@ -2399,13 +2475,18 @@ def main() -> int:
     # `notas/agy_1.1.3_permisos_read_file.md §5ª ronda` para el contexto.
     _db_info = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": []}
     try:
-        _db_info = _parsear_conversacion_db(str(_conv_dir), t_epoch)
-        if _db_info.get("tool_calls") or _db_info.get("web_signals") or _db_info.get("web_urls"):
-            sys.stderr.write(
-                f"[agy] db_steps: tools={len(_db_info['tool_calls'])} "
-                f"web_signals={_db_info['web_signals']} "
-                f"web_urls={_db_info['web_urls'][:5]}\n"
-            )
+        # UUID de conversación del `agy_logfile.log` de ESTA corrida (v24) —
+        # 100% determinístico. Si no hay log (agy no arrancó / --log-file
+        # falló al preparar debug_dir), cae al fallback por mtime.
+        _uuid = _uuid_conversacion_desde_log(agy_log_path)
+        _db_info = _parsear_conversacion_db(str(_conv_dir), t_epoch, _uuid)
+        sys.stderr.write(
+            f"[agy] db_steps: db={os.path.basename(_db_info['db_path']) if _db_info['db_path'] else 'None'} "
+            f"tools={len(_db_info['tool_calls'])} "
+            f"web_signals={_db_info['web_signals']} "
+            f"web_urls={_db_info['web_urls'][:5]} "
+            f"uuid={_uuid or 'N/A'}\n"
+        )
     except Exception as _e:
         sys.stderr.write(f"[agy] WARN _parsear_conversacion_db: {_e}\n")
 
