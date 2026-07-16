@@ -74,8 +74,14 @@ se perdía todo + colgaba 300s; ahora viaja y agy se cierra por quiescencia.
     "fin_presente": bool,       # → QA_BIT_SIN_FIN si false con response no vacío
     "websearch_detectado": bool,# → QA_BIT_AGY_WEBSEARCH (8192)
     "websearch_patrones": [str],
-    "websearch_fuente": str,    # "tools_used" | "heuristica" | "none"
-    "tools_used": [{"name":str,"args":str}],  # parseado del TUI pre-INICIO
+    "websearch_fuente": str,    # "db_steps" | "tools_used" | "heuristica" | "none"
+                                # db_steps (v23+): grounding server-side + tools web
+                                # leídos de la .db de conversación. Cubre `-p` donde
+                                # el chrome del TUI no ecoa y captura el grounding
+                                # `vertexaisearch` que nunca fue visible en `-i`.
+    "tools_used": [{"name":str,"args":str}],  # v23+: si hubo tools en la .db,
+                                # viene de ahí (nombres canónicos + args JSON
+                                # snippet). Fallback al chrome del TUI en `-i`.
     "longitud_sospechosa": bool,# response < UMBRAL (espejo de aistudio)
     "stdout_largo_sospechoso": bool,  # console_raw > UMBRAL_STDOUT_SOSPECHOSO
     "estado_captura": str,      # OK_FIN | QUIESCENT_NO_MARKER | TIMEOUT | PROC_EXIT | ERROR_SPAWN
@@ -1442,6 +1448,216 @@ def _detectar_cuota_en_conversacion(conv_dir: str, t_launch: float) -> tuple:
     return (False, None)
 
 
+# ============================================================
+# DETECTOR .db STEPS: tool calls + web signals (bump v23, 2026-07-16)
+# ============================================================
+# En `-p` el chrome del TUI NO se ecoa a consola → `parsear_tool_calls` sobre
+# `history_text` queda ciego (`tools_used=[]` siempre) y `detectar_websearch`
+# cae al fallback heurístico substring sobre un blob vacío. Peor todavía: el
+# **grounding server-side** (Google Search dentro de `streamGenerateContent`)
+# NUNCA fue visible ni en `-i` — no pasa por permisos ni deja línea en el log.
+# Sí queda rastro en `~/.gemini/antigravity-cli/conversations/<uuid>.db`,
+# tabla `steps`, columnas BLOB `step_payload`/`error_details` (strings ASCII
+# legibles intercalados en el protobuf; probado empíricamente 2026-07-16 con la
+# .db del test de web-search de Tomás: `search_web` + args JSON, `vertexaisearch`,
+# `read_url_content`, URLs a duckduckgo, `run_command`, `RunCommand`).
+#
+# Este detector reusa el mismo mecanismo del detector de cuota (SQLite ro,
+# mtime filter). Es best-effort: cualquier excepción cae al comportamiento
+# heredado (tools_used del TUI + heurística substring).
+
+# Clave canónica que agy escribe en step_payload por cada TOOL CALL real.
+# Ejemplos observados 2026-07-16: "toolAction":"Viewing file",
+# "toolAction":"Running command", "toolAction":"Searching the web",
+# "toolAction":"Reading URL", "toolAction":"Editing file",
+# "toolAction":"Writing file". Va acompañada de "toolSummary" (label humano
+# corto) y de un args JSON. Los DEMÁS nombres que aparecen en el step
+# (`search_web`, `grep`, etc.) son chain-of-thought del modelo mencionando
+# los nombres de otras tools — NO son ejecuciones reales. **Sólo mirar
+# toolAction filtra ese ruido.**
+_TOOL_ACTION_RE = re.compile(r'"toolAction"\s*:\s*"([^"]+)"')
+# Mapeo human-readable ("Running command") → nombre canónico ("run_command")
+# para la salida. Si no matchea, devolver el valor crudo (fallback tolerante a
+# labels futuros o localizados).
+_TOOL_ACTION_TO_CANON = {
+    "Viewing file":                    "view_file",
+    "Reading file":                    "read_file",
+    "Reading prompt instructions":     "read_file",   # esperado en cada job (@prompt.md)
+    "Viewing image for transcription": "view_file",   # esperado en cada job (@imagen.jpg)
+    "Writing file":                    "write_file",
+    "Creating file":                   "create_file",
+    "Editing file":                    "edit_file",
+    "Deleting file":                   "delete_file",
+    "Listing directory":               "list_dir",
+    "Searching files":                 "grep_search",
+    "Searching for files":             "glob",
+    "Running command":                 "run_command",
+    "Searching the web":               "search_web",
+    "Reading URL":                     "read_url_content",
+    "Fetching URL":                    "web_fetch",
+    "Browsing":                        "browser",
+    "Applying patch":                  "apply_patch",
+}
+# Set canónico de tools que se consideran "web" (para poblar el bit
+# websearch_detectado). Grounding server-side es aparte (via _DB_WEB_MARKERS).
+_DB_WEB_TOOL_NAMES = frozenset({
+    "search_web", "read_url_content", "web_fetch", "browser",
+})
+# Patrones (substring) de GROUNDING server-side y URL scraping que NO son
+# tool calls con nombre pero sí evidencia de web. `vertexaisearch` es el
+# grounding real de Google; el resto suele acompañarlo o venir de tool web.
+_DB_WEB_MARKERS = (
+    "vertexaisearch", "groundingMetadata", "grounding_metadata",
+    "webSearchQueries", "web_search_queries",
+)
+# URLs no-google (excluir hosts propios de google para no marcar falsos hits
+# por links a docs/config/etc. que agy pueda mencionar).
+_URL_RE = re.compile(r"https?://([A-Za-z0-9.\-]+)", re.IGNORECASE)
+_URL_GOOGLE_HOSTS_SUFFIX = (
+    "google.com", "googleusercontent.com", "gstatic.com", "googleapis.com",
+    "youtube.com", "ggpht.com", "chromium.org",
+)
+# Snippet corto de un JSON de args para mostrar en tools_used[i].args
+# (primeros ~200 chars del primer bloque `{"...":...}` que aparezca en el step).
+_ARGS_JSON_RE = re.compile(r"\{[^{}]{2,600}\}")
+
+
+def _parsear_conversacion_db(conv_dir: str, t_launch: float) -> dict:
+    """Extrae tool calls + web signals de la .db de conversación de ESTE job.
+
+    Devuelve dict con:
+      - `db_path`     : path de la .db elegida (para copiar al bundle), o None
+      - `tool_calls`  : list[{"name":str,"args":str,"step_idx":int}] — 1 entrada
+                        por tool encontrada por step (deduplicada por (idx,name))
+      - `web_signals` : list[str] — patrones canónicos matcheados (`vertexaisearch`,
+                        `search_web`, `read_url_content`, URL host, etc.)
+      - `web_urls`    : list[str] — hosts URL http(s) no-google encontrados
+
+    Best-effort: cualquier excepción → dict con listas vacías y db_path=None.
+    Prioriza la .db con más steps (heurística: cuota va 1-2 steps, transcripción
+    directa 5-8, exploración/web ≥10).
+    """
+    out = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": []}
+    try:
+        dbs = [
+            p for p in glob.glob(os.path.join(conv_dir, "*.db"))
+            if os.path.getmtime(p) >= t_launch - 2
+        ]
+    except Exception:
+        return out
+    if not dbs:
+        return out
+
+    best = None  # (db_path, [(idx, printable_str), ...])
+    for db in sorted(dbs, key=os.path.getmtime, reverse=True)[:3]:
+        try:
+            uri = "file:" + db.replace("\\", "/") + "?mode=ro"
+            con = sqlite3.connect(uri, uri=True, timeout=2)
+            try:
+                try:
+                    rows = con.execute(
+                        "SELECT idx, step_payload, error_details FROM steps ORDER BY idx"
+                    ).fetchall()
+                except Exception:
+                    rows = con.execute(
+                        "SELECT idx, step_payload FROM steps ORDER BY idx"
+                    ).fetchall()
+            finally:
+                con.close()
+        except Exception:
+            continue
+
+        # Convertir cada step a un blob de strings ASCII imprimibles.
+        steps_strings = []  # [(idx, str_blob_concat)]
+        for row in rows:
+            idx = row[0]
+            parts = []
+            for b in row[1:]:
+                if b is None:
+                    continue
+                if isinstance(b, str):
+                    b = b.encode("utf-8", "replace")
+                parts += [m.group().decode("ascii", "replace")
+                          for m in _PRINTABLE.finditer(b)]
+            steps_strings.append((idx, "\n".join(parts)))
+        if best is None or len(steps_strings) > len(best[1]):
+            best = (db, steps_strings)
+
+    if best is None:
+        return out
+    out["db_path"] = best[0]
+
+    seen_signals = set()
+    seen_hosts = set()
+    prev_call = None  # (canon_name, args_snippet_head) para dedupar plan+ejec
+
+    for idx, blob in best[1]:
+        # Los tool calls reales de agy vienen SÓLO en "toolAction". Cada tool
+        # aparece 2× (step "plan" con type=15 + step "ejec" con type≠15). No
+        # tenemos el step_type acá — dedupamos por (canon, primeros 80 chars de
+        # args) consecutivos: si el step anterior tuvo el mismo tool con los
+        # mismos args, saltar (es el par plan+ejec).
+        actions = _TOOL_ACTION_RE.findall(blob)
+        for action_label in actions:
+            canon = _TOOL_ACTION_TO_CANON.get(action_label, action_label)
+            m = _ARGS_JSON_RE.search(blob)
+            args = m.group(0)[:200] if m else ""
+            key = (canon, args[:80])
+            if key == prev_call:
+                prev_call = key
+                continue
+            prev_call = key
+            out["tool_calls"].append(
+                {"name": canon, "args": args, "step_idx": int(idx)}
+            )
+            if canon in _DB_WEB_TOOL_NAMES and canon not in seen_signals:
+                seen_signals.add(canon)
+                out["web_signals"].append(canon)
+        # Markers de grounding server-side (aparecen incluso sin toolAction).
+        # `vertexaisearch` = grounding real de Google en `streamGenerateContent`,
+        # invisible en `-i` y sin línea de log — sólo se ve acá.
+        for mk in _DB_WEB_MARKERS:
+            if mk in blob and mk not in seen_signals:
+                seen_signals.add(mk)
+                out["web_signals"].append(mk)
+        # URLs no-google (excluir hosts propios de google para no marcar falsos
+        # hits por links a docs/config/etc. que agy pueda mencionar).
+        for host in _URL_RE.findall(blob):
+            hl = host.lower()
+            if any(hl == s or hl.endswith("." + s) for s in _URL_GOOGLE_HOSTS_SUFFIX):
+                continue
+            if hl not in seen_hosts:
+                seen_hosts.add(hl)
+                out["web_urls"].append(hl)
+    return out
+
+
+def _copiar_conv_db_al_bundle(db_path: str, debug_dir: Path) -> None:
+    """Copia consistente de la .db de conversación al bundle forense.
+
+    Usa `sqlite3.Connection.backup()` en vez de `shutil.copy2` porque agy puede
+    tener la .db abierta con WAL (`.db-wal`/`.db-shm` presentes) en el momento
+    en que copiamos → `shutil.copy2` daría una snapshot potencialmente
+    inconsistente. `backup()` copia página-por-página bajo un lock corto,
+    aplicando el WAL pendiente al destino. Best-effort: si falla, warning y
+    seguimos.
+    """
+    dst = debug_dir / "conversation.db"
+    try:
+        src_uri = "file:" + db_path.replace("\\", "/") + "?mode=ro"
+        src = sqlite3.connect(src_uri, uri=True, timeout=2)
+        try:
+            dstcon = sqlite3.connect(str(dst))
+            try:
+                src.backup(dstcon)
+            finally:
+                dstcon.close()
+        finally:
+            src.close()
+    except Exception as e:
+        sys.stderr.write(f"[agy] WARN debug conversation.db: {e}\n")
+
+
 # Firmas de fallo de ARRANQUE de agy anteriores a cualquier generación (cada
 # una muere antes de llamar al endpoint `streamGenerateContent` → NO consume
 # cuota agy). El texto vive en el `--log-file` de agy y/o en la consola (pyte).
@@ -2175,11 +2391,44 @@ def main() -> int:
     except Exception as _e:
         sys.stderr.write(f"[agy] WARN _detectar_arranque_transitorio: {_e}\n")
 
-    # ── Parseo estructurado de tools del TUI (plan #3 §4) ──
-    tools_used = parsear_tool_calls(res.history_text or "")
+    # ── Parseo de la .db de conversación: tool calls + web signals (bump v23) ──
+    # En `-p` el chrome del TUI no ecoa → `parsear_tool_calls` sobre history_text
+    # queda ciego, y el grounding server-side (`vertexaisearch`) nunca se ve ni
+    # en `-i`. La .db tiene todo. Best-effort; si falla, cae al comportamiento
+    # heredado (tools_used del TUI + heurística substring). Ver
+    # `notas/agy_1.1.3_permisos_read_file.md §5ª ronda` para el contexto.
+    _db_info = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": []}
+    try:
+        _db_info = _parsear_conversacion_db(str(_conv_dir), t_epoch)
+        if _db_info.get("tool_calls") or _db_info.get("web_signals") or _db_info.get("web_urls"):
+            sys.stderr.write(
+                f"[agy] db_steps: tools={len(_db_info['tool_calls'])} "
+                f"web_signals={_db_info['web_signals']} "
+                f"web_urls={_db_info['web_urls'][:5]}\n"
+            )
+    except Exception as _e:
+        sys.stderr.write(f"[agy] WARN _parsear_conversacion_db: {_e}\n")
 
-    # ── Detección WebSearch: tools_used primero, heurística como fallback ──
-    ws_info = detectar_websearch(res, tools_used)
+    # ── tools_used: en `-p` viene de la .db; en `-i` del chrome del TUI ──
+    # El chrome del TUI aparece en `history_text` sólo en `-i` (agy interactivo).
+    # En `-p` es siempre "" → el fallback a la .db recupera lo perdido.
+    tools_used_tui = parsear_tool_calls(res.history_text or "")
+    if _db_info["tool_calls"]:
+        tools_used = [
+            {"name": t["name"], "args": t.get("args", "")}
+            for t in _db_info["tool_calls"]
+        ]
+    else:
+        tools_used = tools_used_tui
+
+    # ── Detección WebSearch: .db (fuerte) > tools_used TUI > heurística ──
+    if _db_info["web_signals"] or _db_info["web_urls"]:
+        _pats = list(_db_info["web_signals"]) + [
+            f"url:{h}" for h in _db_info["web_urls"][:8]
+        ]
+        ws_info = {"detectado": True, "patrones": _pats, "fuente": "db_steps"}
+    else:
+        ws_info = detectar_websearch(res, tools_used_tui)
 
     # ── Token usage real via statusLine side-channel (plan #3 §5) ──
     # Degrada limpio a tokens_*=0 si el setup manual del statusLine no está hecho.
@@ -2219,6 +2468,12 @@ def main() -> int:
             "zombis_barridos": zombis,
             "websearch": ws_info,
             "tools_used": tools_used,
+            "db_steps": {
+                "db_path": _db_info.get("db_path"),
+                "tool_calls": _db_info.get("tool_calls") or [],
+                "web_signals": _db_info.get("web_signals") or [],
+                "web_urls": _db_info.get("web_urls") or [],
+            },
             "tokens": tokens,
             "veredicto": out["veredicto"],
             "fuente_response": out["fuente_response"],
@@ -2239,6 +2494,14 @@ def main() -> int:
             "fecha_iso": out["fecha_iso"],
         }
         volcar_debug_bundle(debug_dir, res, metrics, agy_log_path)
+        # v23: copia consistente de la .db de conversación al bundle (evidencia
+        # cruda para auditar grounding web / tool calls / cuota que sólo viven
+        # en SQLite bajo `-p`). Best-effort.
+        if _db_info.get("db_path"):
+            try:
+                _copiar_conv_db_al_bundle(_db_info["db_path"], debug_dir)
+            except Exception as _e:
+                sys.stderr.write(f"[agy] WARN copia conversation.db: {_e}\n")
 
     sys.stderr.write(
         f"[agy] veredicto={out['veredicto']} ok={out['ok']} "
