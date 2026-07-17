@@ -192,30 +192,26 @@ CMD_I_DEFAULT = ("Transcribí la imagen @imagen.jpg siguiendo al pie de la letra
 # (no escribimos output.txt; leemos consola), deny defensivo de WebSearch
 # (NO confiable: por eso lo detectamos en console_raw).
 #
-# v26 (2026-07-17) — mitigación PROACTIVA del ritual `echo "Starting transcription"`
+# v27 (2026-07-17) — mitigación PROACTIVA del ritual `echo "Starting transcription"`
 # que emite Gemini 3.1 Pro esporádicamente antes de transcribir en `-p`. Sin este
 # allow, el `echo` chocaba con `command(*)` en deny → agy auto-deniega en headless
 # → response literal "jetski: no output produced…" → job muere. Con v25 el jetski
 # ya se etiqueta como `jetski_headless_deny: tool='command'` en vez de esconderse
 # bajo `exploracion_agy`, pero seguía siendo terminal. Este allow lo previene.
 #
-# Sintaxis: 4 patterns cubren las dos lecturas posibles de la doc oficial de
-# agent-permissions ("exact word/token prefix" con "each whitespace-separated
-# token is evaluated as an anchored regex `^(?:pattern)$`"): interpretación
-# "prefix" (basta con el 1º) e interpretación "estricta por tokens" (necesita
-# uno por cada N tokens post-echo). Cinturón + tirantes; JSON un poco más largo,
-# cero riesgo funcional. Ver notas/motor_agy.md §Bump v26 para el checklist de
-# validación (a confirmar en próxima investigación: (a) allow gana sobre el
-# `command(*)` en deny, (b) el ritual del modelo respeta el patrón, (c) no aparece
-# uso malicioso de echo).
+# Sintaxis: `command(echo)`. La doc de agent-permissions dice "matches commands
+# by exact word/token prefix"; interpretación esperada = prefix (todo command que
+# arranque con `echo` matchea, incluyendo `echo "Starting transcription"`). A
+# validar en próxima investigación de jobs — ver notas/motor_agy.md §Bump v27
+# para el checklist: (a) allow gana sobre el `command(*)` en deny, (b) el patrón
+# realmente cubre `echo <args con espacios/quotes>`, (c) no aparece uso malicioso.
+# Si en (b) resulta que la interpretación es estricta por-token en vez de prefix,
+# habrá que agregar variantes `command(echo .*)`, `command(echo .* .*)`, etc.
 SANDBOX_SETTINGS = {
     "permissions": {
         "allow": [
             "tool(read_file)",
             "command(echo)",
-            "command(echo .*)",
-            "command(echo .* .*)",
-            "command(echo .* .* .*)",
         ],
         "deny": [
             "command(*)", "tool(run_terminal_cmd)", "tool(execute_command)",
