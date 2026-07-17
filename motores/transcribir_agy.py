@@ -2054,22 +2054,86 @@ def shape_salida(
         ok and 0 < len(response) < UMBRAL_LONGITUD_SOSPECHOSA
     )
 
-    # Firma "exploración agy": el modelo usó run_command (Get-ChildItem, etc.)
-    # para buscar los archivos en vez de leer @imagen.jpg, y devolvió como
-    # respuesta el mensaje conversacional de exploración ("Estoy buscando…").
-    # Tres flags concurrentes la identifican unívocamente vs una transcripción
-    # real (incluso de página casi vacía, que siempre lleva marcadores):
+    # ── DESAMBIGÜE DE `exploracion_agy` (bump v25) ────────────────────────────
+    # Contexto: hasta v24 el único check post-decidir_veredicto era el de
+    # "exploracion_agy" (fuente=history + !fin + longitud_sospechosa). Ese
+    # check nació para la firma del job 7123 (response conversacional "Estoy
+    # buscando los archivos…"). Pero en producción el mismo check terminó
+    # etiquetando bajo `exploracion_agy` al menos 3 firmas ajenas — todas con
+    # response corto sin marcadores → matchean los mismos 3 flags:
+    #   A. jetski headless deny  → agy en `-p` auto-deniega una tool (read_file,
+    #      command, …) y emite en el response el mensaje literal
+    #      "jetski: no output produced — a tool required the \"<tool>\" permission…".
+    #      TERMINAL: no vale reintentar sin cambiar SANDBOX_SETTINGS o el prompt.
+    #   B. executor terminated → agy muere pre-arranque con `printmode.go`
+    #      "run ended with error and no response: Agent execution terminated
+    #      due to error." (response literal 47 chars). Sub-causas del
+    #      agy_logfile.log: "neither PlanModel nor RequestedModel specified"
+    #      (bug del CLI), UNAUTHENTICATED 401 (auth stale), "model unreachable"
+    #      (red), HTTP 502. TRANSITORIO: reintento suele andar (el harness
+    #      del bump v19 ya lo soporta).
+    #   C. auth expired → response arranca con "Authentication required." o
+    #      contiene "Please visit the URL to log in". TERMINAL: la cuenta
+    #      necesita relogin manual; reintentar loopea.
+    # Estos chequeos van ANTES del de exploracion_agy, así el original queda
+    # como último resort para el caso conversacional real. Retrocompat:
+    # - Un caso que hoy cae en exploracion_agy y no matchea A/B/C sigue
+    #   cayendo en exploracion_agy con la misma etiqueta.
+    # - El shape no cambia claves ni tipos.
+    # - veredicto=TRANSITORIO ya está mapeado por lib_worker_policy.php
+    #   (agyAccionResultado → RETRY → AgyTransitorioException).
+    resp_stripped = (response or "").strip()
+    firma_transitorio_motivo_forzado = None
+    firma_detectada = None
+    if ok and resp_stripped.startswith("jetski:"):
+        m = re.search(r'required the "([^"]+)" permission', resp_stripped)
+        tool_denegada = m.group(1) if m else "desconocida"
+        firma_detectada = "A_jetski"
+        ok = False
+        veredicto = "ERROR"
+        error = (
+            f"jetski_headless_deny: agy en -p auto-denegó la tool '{tool_denegada}' "
+            f"(headless no puede pedir confirmación interactiva). No reintentable "
+            f"sin agregar 'command(...)' u otro allow en SANDBOX_SETTINGS, o reforzar "
+            f"el prompt para que el modelo no invoque esa tool"
+        )
+    elif ok and resp_stripped == "Error: Agent execution terminated due to error.":
+        firma_detectada = "B_executor_terminated"
+        ok = False
+        veredicto = "TRANSITORIO"
+        firma_transitorio_motivo_forzado = "executor_terminated_prearranque"
+        error = (
+            "agy_terminado_prearranque: response literal 'Error: Agent execution "
+            "terminated due to error.' (agy salió antes de generar). Sub-causas "
+            "habituales en debug/agy_logfile.log: 'neither PlanModel nor RequestedModel', "
+            "UNAUTHENTICATED (401), 'model unreachable' (red), HTTP 502. Reintentable"
+        )
+    elif ok and (resp_stripped.startswith("Authentication required")
+                 or "Please visit the URL to log in" in resp_stripped[:400]):
+        firma_detectada = "C_auth_expired"
+        ok = False
+        veredicto = "ERROR"
+        error = (
+            "auth_agy_expirada: la cuenta agy pide re-login interactivo "
+            "(response arranca con 'Authentication required' o contiene 'Please visit "
+            "the URL to log in'). Requiere /logout + relogin manual de la cuenta"
+        )
+    # ── Firma original de exploración conversacional (bump v12) ───────────────
+    # Sólo llega acá si NINGUNA firma específica arriba matcheó. Los 3 flags
+    # concurrentes identifican unívocamente el mensaje conversacional del
+    # modelo ("Estoy buscando los archivos imagen.jpg y prompt.md…") vs una
+    # transcripción real (incluso página casi vacía lleva INICIO/FIN):
     #   - fuente_response == "history": no hubo INICIO/FIN
     #   - not fin_presente: tampoco el cierre suelto
     #   - longitud_sospechosa: response < UMBRAL_LONGITUD_SOSPECHOSA
     # Caso 2026-06-25 (job 7123 prensa, edi 2961 p4): response="Estoy
     # buscando los archivos imagen.jpg y prompt.md en tu sistema…" (198
-    # chars) entró como transcripción vigente. Ver notas/motor_agy.md
-    # §Permisos (los denies de tool() son no-op; único lever real es
-    # prompt+modelo). Forzar ERROR acá protege a TODOS los consumidores
-    # del core (prensa + v3); response queda en el dict para que PHP lo
-    # logue en api_rawresponse y el operador audite qué dijo el modelo.
+    # chars). Ver notas/motor_agy.md §Permisos (los denies de tool() son
+    # no-op; único lever real es prompt+modelo). Forzar ERROR acá protege a
+    # TODOS los consumidores del core (prensa + v3); response queda en el
+    # dict para que PHP lo logue en api_rawresponse y el operador audite.
     if ok and fuente_response == "history" and not fin_presente and longitud_sospechosa:
+        firma_detectada = "D_exploracion_conversacional"
         ok = False
         veredicto = "ERROR"
         error = (
@@ -2113,7 +2177,13 @@ def shape_salida(
         # Motivo del fallo de arranque transitorio (pre-generación) cuando
         # veredicto==TRANSITORIO; "" si no aplica. Forense (viaja al bundle
         # debug). El worker rutea el reintento por veredicto, no por este campo.
-        "transitorio_motivo": str(getattr(res, "transitorio_motivo", "") or ""),
+        # v25: si el desambigüe de arriba forzó veredicto=TRANSITORIO por firma
+        # específica (executor_terminated_prearranque), gana esa etiqueta sobre
+        # el motivo default de _detectar_arranque_transitorio.
+        "transitorio_motivo": (
+            firma_transitorio_motivo_forzado
+            or str(getattr(res, "transitorio_motivo", "") or "")
+        ),
         # Extras agy (consumidos por lib_agy.php + worker)
         "fuente_response": fuente_response,
         "fin_presente": bool(fin_presente),
