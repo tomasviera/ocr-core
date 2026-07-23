@@ -1637,14 +1637,22 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
          el UUID, etc.).
 
     Retorna dict con:
-      - `db_path`     : path de la .db elegida (para copiar al bundle), o None
-      - `tool_calls`  : list[{"name":str,"args":str,"step_idx":int}]
-      - `web_signals` : list[str] — patrones canónicos matcheados
-      - `web_urls`    : list[str] — hosts URL http(s) no-google encontrados
+      - `db_path`         : path de la .db elegida (para copiar al bundle), o None
+      - `tool_calls`      : list[{"name":str,"args":str,"step_idx":int}]
+      - `web_signals`     : list[str] — patrones canónicos matcheados
+      - `web_urls`        : list[str] — hosts URL http(s) no-google encontrados
+      - `imagen_cargada`  : bool|None — True si algún step de tool result confirma
+                            que agy adjuntó imagen.jpg al contexto multimodal
+                            (marcadores concurrentes: `imagen.jpg` + `image/` +
+                            `tempmediaStorage`). False si se leyó la DB y no
+                            aparece la firma. None si no se pudo leer ninguna DB
+                            (dato desconocido — evita QA falsos positivos).
 
-    Best-effort: cualquier excepción → dict con listas vacías y db_path=None.
+    Best-effort: cualquier excepción → dict con listas vacías, db_path=None,
+    imagen_cargada=None.
     """
-    out = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": []}
+    out = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": [],
+           "imagen_cargada": None}
 
     # ── Vía 1 (preferida): UUID exacto del logfile ──
     steps_strings = None  # [(idx, printable_str_blob), ...]
@@ -1685,6 +1693,17 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
     seen_signals = set()
     seen_hosts = set()
     prev_call = None  # (canon_name, args_snippet_head) para dedupar plan+ejec
+    # Chequeo fáctico: imagen.jpg efectivamente adjuntada al contexto
+    # multimodal. Firma unívoca (muestreo 2026-07-23, 25 debug dirs, cero
+    # falsos positivos): un mismo step de tool result contiene los 3
+    # markers concurrentes `imagen.jpg` + `image/` + `tempmediaStorage`.
+    # `image/*` es el mime del binario adjuntado; `tempmediaStorage` es el
+    # blob `<home>/.gemini/antigravity-cli/brain/<conv>/.tempmediaStorage/
+    # media_<conv>_<epoch>.png` donde agy stagea la imagen resuelta.
+    # Sin los 3 juntos, agy NO cargó la imagen (o falló silenciosamente).
+    # Como llegamos acá con steps_strings != None, la lectura fue OK →
+    # arrancamos en False (evidencia conocida: no vimos la firma todavía).
+    imagen_cargada = False
 
     for idx, blob in steps_strings:
         # Los tool calls reales de agy vienen SÓLO en "toolAction". Cada tool
@@ -1724,6 +1743,14 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
             if hl not in seen_hosts:
                 seen_hosts.add(hl)
                 out["web_urls"].append(hl)
+        # Chequeo fáctico "imagen cargada al contexto multimodal" (bump v28).
+        # Los 3 markers en el mismo blob del step son firma unívoca.
+        if (not imagen_cargada
+                and "imagen.jpg" in blob
+                and "image/" in blob
+                and "tempmediaStorage" in blob):
+            imagen_cargada = True
+    out["imagen_cargada"] = imagen_cargada
     return out
 
 
@@ -2229,6 +2256,20 @@ def shape_salida(
         "quota_h5_pct_usado":     tokens.get("quota_h5_pct_usado"),
         "quota_h5_reset_seg":     tokens.get("quota_h5_reset_seg"),
         "account_email":          tokens.get("account_email"),
+        # Chequeo fáctico "agy adjuntó imagen.jpg al contexto multimodal"
+        # (bump v28, 2026-07-23). Firma unívoca en `steps` de la .db de
+        # conversación (ver `_parsear_conversacion_db`). Valores:
+        #   True  → imagen efectivamente cargada al contexto.
+        #   False → DB legible pero sin la firma → agy transcribió (o dijo
+        #           que no pudo) SIN haber visto la imagen → posible
+        #           alucinación → worker inyecta QA grave NO_CARGO_IMAGEN.
+        #   None  → DB no legible / no encontrada → unknown → worker NO
+        #           inyecta QA (evita falso positivo).
+        # Ver notas/motor_agy.md §"Bump v28".
+        "imagen_cargada_ok": (
+            None if getattr(res, "imagen_cargada_ok", None) is None
+            else bool(res.imagen_cargada_ok)
+        ),
         "fecha_iso": datetime.now().isoformat(timespec='seconds'),
     }
 
@@ -2562,7 +2603,8 @@ def main() -> int:
     # en `-i`. La .db tiene todo. Best-effort; si falla, cae al comportamiento
     # heredado (tools_used del TUI + heurística substring). Ver
     # `notas/agy_1.1.3_permisos_read_file.md §5ª ronda` para el contexto.
-    _db_info = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": []}
+    _db_info = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": [],
+                "imagen_cargada": None}
     try:
         # UUID de conversación del `agy_logfile.log` de ESTA corrida (v24) —
         # 100% determinístico. Si no hay log (agy no arrancó / --log-file
@@ -2574,10 +2616,16 @@ def main() -> int:
             f"tools={len(_db_info['tool_calls'])} "
             f"web_signals={_db_info['web_signals']} "
             f"web_urls={_db_info['web_urls'][:5]} "
+            f"imagen_cargada={_db_info.get('imagen_cargada')} "
             f"uuid={_uuid or 'N/A'}\n"
         )
     except Exception as _e:
         sys.stderr.write(f"[agy] WARN _parsear_conversacion_db: {_e}\n")
+
+    # Propagar al `res` para que shape_salida lo lea (mismo patrón que
+    # cuota_reset_seg / transitorio_motivo). None = no se pudo leer la DB
+    # (unknown → PHP NO dispara el QA para no generar falso positivo).
+    res.imagen_cargada_ok = _db_info.get("imagen_cargada")
 
     # ── tools_used: en `-p` viene de la .db; en `-i` del chrome del TUI ──
     # El chrome del TUI aparece en `history_text` sólo en `-i` (agy interactivo).
@@ -2643,6 +2691,7 @@ def main() -> int:
                 "tool_calls": _db_info.get("tool_calls") or [],
                 "web_signals": _db_info.get("web_signals") or [],
                 "web_urls": _db_info.get("web_urls") or [],
+                "imagen_cargada": _db_info.get("imagen_cargada"),
             },
             "tokens": tokens,
             "veredicto": out["veredicto"],
@@ -2677,6 +2726,7 @@ def main() -> int:
         f"[agy] veredicto={out['veredicto']} ok={out['ok']} "
         f"fuente={out['fuente_response']} estado={out['estado_captura']} "
         f"fin={out['fin_presente']} ws={out['websearch_detectado']} "
+        f"img={out['imagen_cargada_ok']} "
         f"tools={len(tools_used)} statusln={out['statusline_disponible']} "
         f"tok_in={out['tokens_input']} tok_out={out['tokens_output']} "
         f"len_resp={len(out['response'] or '')} dur={out['duracion_seg']}s "

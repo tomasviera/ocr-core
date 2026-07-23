@@ -881,7 +881,7 @@ function _agyShapeError(string $errorMsg, float $t0Total): array
  *   websearch_patrones, websearch_fuente, tools_used, longitud_sospechosa,
  *   stdout_largo_sospechoso, estado_captura, bytes_leidos, zombis_barridos,
  *   modelo_pedido, statusline_disponible, context_window_size,
- *   used_percentage, plan_tier.
+ *   used_percentage, plan_tier, imagen_cargada_ok (bool|null, bump v28).
  *
  * `fuente_response` (agregado 2026-06-21) indica de dónde salió `response`
  * para que el worker decida QA bits post-hoc:
@@ -951,6 +951,16 @@ function _agyShapeRespuesta(
     // 500 al resolver modelo, auth/keyring timeout, etc. El worker rutea el
     // reintento por `veredicto`; este campo es para el error_msg/forense.
     if (isset($data['transitorio_motivo']))  $extras['transitorio_motivo']       = (string) $data['transitorio_motivo'];
+    // Chequeo fáctico "agy adjuntó imagen.jpg al contexto multimodal" (bump v28,
+    // 2026-07-23). Firma unívoca en la .db de conversación (ver
+    // `_parsear_conversacion_db` del .py + notas/motor_agy.md §"Bump v28").
+    // Tri-estado (bool | null): true=cargada, false=NO cargada (DB legible sin
+    // firma → posible alucinación), null=unknown (DB no legible → NO disparar
+    // QA para evitar falsos positivos). El worker inyecta `QA_BIT_NO_CARGO_IMAGEN`
+    // sólo en `imagen_cargada_ok === false`.
+    $extras['imagen_cargada_ok'] = array_key_exists('imagen_cargada_ok', $data)
+        ? $data['imagen_cargada_ok']
+        : null;
 
     // Token usage del statusLine side-channel (leído por el .py tras cerrar agy).
     // Si el setup manual del statusLine no se hizo, todos quedan en 0. A
