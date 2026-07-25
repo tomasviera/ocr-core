@@ -2121,6 +2121,10 @@ def shape_salida(
     #   C. auth expired → response arranca con "Authentication required." o
     #      contiene "Please visit the URL to log in". TERMINAL: la cuenta
     #      necesita relogin manual; reintentar loopea.
+    #   E. eligibility 429 (bump v29) → response literal "Error: Eligibility check
+    #      failed: RESOURCE_EXHAUSTED (code 429): …". Rate limit del backend de
+    #      code assist en el arranque (fetchUserInfo/loadCodeAssist), sin llamada
+    #      al LLM. TRANSITORIO: reintento con backoff corto. Detalle abajo.
     # Estos chequeos van ANTES del de exploracion_agy, así el original queda
     # como último resort para el caso conversacional real. Retrocompat:
     # - Un caso que hoy cae en exploracion_agy y no matchea A/B/C sigue
@@ -2153,6 +2157,41 @@ def shape_salida(
             "terminated due to error.' (agy salió antes de generar). Sub-causas "
             "habituales en debug/agy_logfile.log: 'neither PlanModel nor RequestedModel', "
             "UNAUTHENTICATED (401), 'model unreachable' (red), HTTP 502. Reintentable"
+        )
+    elif ok and ("eligibility check failed" in resp_stripped[:200].lower()
+                 and "resource_exhausted" in resp_stripped.lower()):
+        # E. eligibility check 429 (bump v29). agy muere en el chequeo de
+        #    elegibilidad del print mode — ANTES de cualquier generación:
+        #      http_helpers.go: Failed to make code assist backend request
+        #        (…v1internal:fetchUserInfo): 429 RESOURCE_EXHAUSTED
+        #      printmode.go: Print mode: eligibility check failed: …
+        #    El response literal es una línea de ~111 chars, así que caía en
+        #    `exploracion_agy` (fuente=history + !fin + corto) y terminaba
+        #    ERROR fail-fast → la página moría sin reintento y con un
+        #    diagnóstico falso ("agy exploró con run_command").
+        #
+        #    Evidencia (prensa, agy_debug 2026-07-24, 9 casos): `streamGenerateContent`
+        #    ausente en el agy_logfile.log en los 9 → agy NUNCA llamó al LLM →
+        #    cuota de generación NO consumida → reintentable (misma regla que B).
+        #
+        #    NO confundir con cuota agotada real: ésa la detecta
+        #    `_detectar_cuota_en_conversacion` sobre la .db y sale por
+        #    veredicto=CUOTA mucho antes (texto "Individual quota reached",
+        #    reset de horas/días). Acá el proceso ni siquiera llegó a abrir
+        #    conversación. Por eso el match exige RESOURCE_EXHAUSTED explícito:
+        #    un "eligibility check failed" con OTRO código (401/403 = cuenta
+        #    sin elegibilidad, suscripción vencida) NO es reintentable y sigue
+        #    cayendo en el `exploracion_agy` de siempre (status quo conservador).
+        firma_detectada = "E_eligibility_429"
+        ok = False
+        veredicto = "TRANSITORIO"
+        firma_transitorio_motivo_forzado = "eligibility_429"
+        error = (
+            "eligibility_429: el chequeo de elegibilidad del print mode falló con "
+            "RESOURCE_EXHAUSTED (429) — rate limit del backend de code assist en el "
+            "ARRANQUE, sin llamada al LLM (sin consumo de cuota de generación). "
+            "Reintentable con backoff corto; NO es cuota agotada (ésa sale por "
+            "veredicto=CUOTA con 'Individual quota reached')"
         )
     elif ok and (resp_stripped.startswith("Authentication required")
                  or "Please visit the URL to log in" in resp_stripped[:400]):
