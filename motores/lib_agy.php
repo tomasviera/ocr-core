@@ -881,7 +881,8 @@ function _agyShapeError(string $errorMsg, float $t0Total): array
  *   websearch_patrones, websearch_fuente, tools_used, longitud_sospechosa,
  *   stdout_largo_sospechoso, estado_captura, bytes_leidos, zombis_barridos,
  *   modelo_pedido, statusline_disponible, context_window_size,
- *   used_percentage, plan_tier, imagen_cargada_ok (bool|null, bump v28).
+ *   used_percentage, plan_tier, imagen_cargada_ok (bool|null, bump v28),
+ *   citation_urls (string[], bump v30 — atribución/recitación, NO web).
  *
  * `fuente_response` (agregado 2026-06-21) indica de dónde salió `response`
  * para que el worker decida QA bits post-hoc:
@@ -961,6 +962,19 @@ function _agyShapeRespuesta(
     $extras['imagen_cargada_ok'] = array_key_exists('imagen_cargada_ok', $data)
         ? $data['imagen_cargada_ok']
         : null;
+    // Citations del checker de atribución/recitación de Google (bump v30,
+    // 2026-07-24). Lista de URIs de `CitationSource` halladas en la .db de esta
+    // corrida (ver `_CITATION_URI_RE` del .py). Semántica:
+    //   []      → sin citations (o .db ilegible) → sin acción.
+    //   [urls…] → el backend atribuyó tramos del texto generado a material
+    //             indexado ⇒ recitación de memoria. **NO es acceso web** (los
+    //             hosts de citation se excluyen de `web_urls` en el mismo bump).
+    // El worker inyecta `QA_BIT_RECITATION` y registra `paginas_bloqueo_gemini`
+    // cuando viene no-vacía. Core viejo (v≤29) no manda la clave → [] → no-op.
+    // Ver notas/bloqueo_qa_recurrente.md §"Evidencia forense".
+    $extras['citation_urls'] = (array_key_exists('citation_urls', $data) && is_array($data['citation_urls']))
+        ? array_values(array_filter(array_map('strval', $data['citation_urls'])))
+        : [];
 
     // Token usage del statusLine side-channel (leído por el .py tras cerrar agy).
     // Si el setup manual del statusLine no se hizo, todos quedan en 0. A

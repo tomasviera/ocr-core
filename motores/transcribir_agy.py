@@ -1566,6 +1566,60 @@ _URL_GOOGLE_HOSTS_SUFFIX = (
     "google.com", "googleusercontent.com", "gstatic.com", "googleapis.com",
     "youtube.com", "ggpht.com", "chromium.org",
 )
+# ── Citations del checker de atribución/recitación (bump v30, 2026-07-24) ────
+# Cuando el texto generado matchea material indexado, el backend adjunta al
+# candidato un `CitationMetadata` con N × `CitationSource`:
+#     message CitationSource {
+#       optional int32  start_index = 1;   # \x08 <varint>
+#       optional int32  end_index   = 2;   # \x10 <varint>
+#       optional string uri         = 3;   # \x1a <len> <bytes>
+#       optional string license     = 4;
+#     }
+# En la `.db` eso queda como bytes crudos en el `step_payload` del step de
+# respuesta (`step_type=15`), inmediatamente después del texto truncado.
+# **NO es evidencia de web**: el modelo no navegó. Verificado 2026-07-24 sobre
+# los 12 bundles de `temp/agy_debug/` que traen citations (hemerotecas
+# digitalizadas: cdigital.dgb.uanl.mx, bibliotecavirtualmadrid, prensahistorica
+# .mcu.es, archivos.juridicas.unam.mx): **cero** marcadores de grounding
+# (`vertexaisearch`/`groundingMetadata`/`webSearchQueries`) y **cero**
+# toolActions de web en los 12. Es el checker de recitación de Google marcando
+# que el modelo reprodujo material memorizado — la contracara del corte de
+# stream (los 12 son `fuente_response=ini_only`, y ninguno de los `ini_fin`
+# trae citations).
+# Se extraen para dos cosas: (a) NO contarlas como `web_urls` — prendían el bit
+# WEBSEARCH sin que hubiera búsqueda; (b) exponerlas como evidencia de la
+# recitación enmascarada que documenta `notas/bloqueo_qa_recurrente.md`.
+_PB_VARINT = rb"(?:[\x80-\xff]{0,4}[\x00-\x7f])"
+_CITATION_URI_RE = re.compile(
+    rb"\x08" + _PB_VARINT +          # start_index
+    rb"\x10" + _PB_VARINT +          # end_index
+    rb"\x1a" + _PB_VARINT +          # len(uri)
+    rb"(https?://[\x21-\x7e]{4,300})"
+)
+
+
+def _citation_urls_de_rows(rows: list) -> list:
+    """URLs de `CitationSource` en los BLOBs CRUDOS de `steps` (bump v30).
+
+    Trabaja sobre bytes, no sobre los strings imprimibles de
+    `_steps_a_strings`: la firma que discrimina una citation de una URL
+    cualquiera es estructural (los dos varints `start_index`/`end_index`
+    inmediatamente antes del `uri`), y esos bytes no sobreviven la extracción
+    ASCII. No parsea el protobuf completo — matchea la firma del submensaje.
+    Best-effort: cualquier excepción la absorbe el caller."""
+    vistas, out = set(), []
+    for row in rows:
+        for b in row[1:]:
+            if b is None:
+                continue
+            if isinstance(b, str):
+                b = b.encode("utf-8", "replace")
+            for m in _CITATION_URI_RE.finditer(bytes(b)):
+                u = m.group(1).decode("ascii", "replace")
+                if u not in vistas:
+                    vistas.add(u)
+                    out.append(u)
+    return out
 # Snippet corto de un JSON de args para mostrar en tools_used[i].args
 # (primeros ~200 chars del primer bloque `{"...":...}` que aparezca en el step).
 _ARGS_JSON_RE = re.compile(r"\{[^{}]{2,600}\}")
@@ -1640,7 +1694,12 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
       - `db_path`         : path de la .db elegida (para copiar al bundle), o None
       - `tool_calls`      : list[{"name":str,"args":str,"step_idx":int}]
       - `web_signals`     : list[str] — patrones canónicos matcheados
-      - `web_urls`        : list[str] — hosts URL http(s) no-google encontrados
+      - `web_urls`        : list[str] — hosts URL http(s) no-google encontrados,
+                            EXCLUIDOS los hosts que sólo aparecen como
+                            `CitationSource` (v30: no son evidencia de web)
+      - `citation_urls`   : list[str] — URLs completas de `CitationSource` del
+                            checker de atribución/recitación de Google. Evidencia
+                            de recitación enmascarada, NO de acceso web
       - `imagen_cargada`  : bool|None — True si algún step de tool result confirma
                             que agy adjuntó imagen.jpg al contexto multimodal
                             (marcadores concurrentes: `imagen.jpg` + `image/` +
@@ -1652,17 +1711,19 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
     imagen_cargada=None.
     """
     out = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": [],
-           "imagen_cargada": None}
+           "citation_urls": [], "imagen_cargada": None}
 
     # ── Vía 1 (preferida): UUID exacto del logfile ──
     steps_strings = None  # [(idx, printable_str_blob), ...]
     chosen_db = None
+    chosen_rows = None    # rows CRUDAS de la .db elegida (bump v30: citations)
     if uuid_conversacion:
         cand = os.path.join(conv_dir, f"{uuid_conversacion}.db")
         if os.path.isfile(cand):
             rows = _leer_steps_db(cand)
             if rows is not None:
                 chosen_db = cand
+                chosen_rows = rows
                 steps_strings = _steps_a_strings(rows)
 
     # ── Vía 2 (fallback): scan por mtime, elegir la de más steps ──
@@ -1676,19 +1737,35 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
             return out
         if not dbs:
             return out
-        best = None  # (db_path, steps_strings)
+        best = None  # (db_path, steps_strings, rows_crudas)
         for db in sorted(dbs, key=os.path.getmtime, reverse=True)[:10]:
             rows = _leer_steps_db(db)
             if rows is None:
                 continue
             ss = _steps_a_strings(rows)
             if best is None or len(ss) > len(best[1]):
-                best = (db, ss)
+                best = (db, ss, rows)
         if best is None:
             return out
-        chosen_db, steps_strings = best[0], best[1]
+        chosen_db, steps_strings, chosen_rows = best[0], best[1], best[2]
 
     out["db_path"] = chosen_db
+
+    # ── Citations del checker de atribución/recitación (bump v30) ──
+    # Se extraen ANTES del loop de URLs porque sus hosts se excluyen de
+    # `web_urls`. Un host que además tenga actividad web real sigue prendiendo
+    # el bit por `web_signals` (toolAction web / marcador de grounding), que
+    # este filtro no toca — por eso excluir el host acá no puede tapar una
+    # búsqueda real.
+    citation_hosts = set()
+    try:
+        out["citation_urls"] = _citation_urls_de_rows(chosen_rows or [])
+        for _u in out["citation_urls"]:
+            _m = _URL_RE.match(_u)
+            if _m:
+                citation_hosts.add(_m.group(1).lower())
+    except Exception:
+        out["citation_urls"] = []
 
     seen_signals = set()
     seen_hosts = set()
@@ -1739,6 +1816,9 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
         for host in _URL_RE.findall(blob):
             hl = host.lower()
             if any(hl == s or hl.endswith("." + s) for s in _URL_GOOGLE_HOSTS_SUFFIX):
+                continue
+            # v30: host que viene de un `CitationSource` no es evidencia de web.
+            if hl in citation_hosts:
                 continue
             if hl not in seen_hosts:
                 seen_hosts.add(hl)
@@ -2309,6 +2389,16 @@ def shape_salida(
             None if getattr(res, "imagen_cargada_ok", None) is None
             else bool(res.imagen_cargada_ok)
         ),
+        # Citations del checker de atribución/recitación de Google (bump v30,
+        # 2026-07-24). Lista de URIs de `CitationSource` halladas en la .db de
+        # ESTA corrida (ver `_CITATION_URI_RE`). Semántica para el consumidor:
+        #   []      → no hubo citations (o no se pudo leer la .db). Sin acción.
+        #   [urls…] → el backend atribuyó tramos del texto generado a material
+        #             indexado ⇒ el modelo recitó de memoria. Combinado con un
+        #             corte de stream (`fin_presente=false`) es la firma de la
+        #             recitación enmascarada. **NO es evidencia de acceso web.**
+        # Ver notas/bloqueo_qa_recurrente.md §"Evidencia forense".
+        "citation_urls": list(getattr(res, "citation_urls", None) or []),
         "fecha_iso": datetime.now().isoformat(timespec='seconds'),
     }
 
@@ -2643,7 +2733,7 @@ def main() -> int:
     # heredado (tools_used del TUI + heurística substring). Ver
     # `notas/agy_1.1.3_permisos_read_file.md §5ª ronda` para el contexto.
     _db_info = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": [],
-                "imagen_cargada": None}
+                "citation_urls": [], "imagen_cargada": None}
     try:
         # UUID de conversación del `agy_logfile.log` de ESTA corrida (v24) —
         # 100% determinístico. Si no hay log (agy no arrancó / --log-file
@@ -2655,6 +2745,7 @@ def main() -> int:
             f"tools={len(_db_info['tool_calls'])} "
             f"web_signals={_db_info['web_signals']} "
             f"web_urls={_db_info['web_urls'][:5]} "
+            f"citations={len(_db_info.get('citation_urls') or [])} "
             f"imagen_cargada={_db_info.get('imagen_cargada')} "
             f"uuid={_uuid or 'N/A'}\n"
         )
@@ -2665,6 +2756,8 @@ def main() -> int:
     # cuota_reset_seg / transitorio_motivo). None = no se pudo leer la DB
     # (unknown → PHP NO dispara el QA para no generar falso positivo).
     res.imagen_cargada_ok = _db_info.get("imagen_cargada")
+    # v30: citations del checker de atribución/recitación → shape → PHP.
+    res.citation_urls = _db_info.get("citation_urls") or []
 
     # ── tools_used: en `-p` viene de la .db; en `-i` del chrome del TUI ──
     # El chrome del TUI aparece en `history_text` sólo en `-i` (agy interactivo).
@@ -2730,6 +2823,9 @@ def main() -> int:
                 "tool_calls": _db_info.get("tool_calls") or [],
                 "web_signals": _db_info.get("web_signals") or [],
                 "web_urls": _db_info.get("web_urls") or [],
+                # v30: evidencia de recitación enmascarada (NO de web). Ver
+                # `_CITATION_URI_RE` y `notas/bloqueo_qa_recurrente.md`.
+                "citation_urls": _db_info.get("citation_urls") or [],
                 "imagen_cargada": _db_info.get("imagen_cargada"),
             },
             "tokens": tokens,
