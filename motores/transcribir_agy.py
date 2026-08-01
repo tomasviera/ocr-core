@@ -350,7 +350,28 @@ def detectar_loop_degenerado(texto: str) -> dict:
     if not texto or len(texto) < LOOP_MIN_CHARS:
         return vacio
 
-    cola = texto[-LOOP_VENTANA_CHARS:]
+    # Se mide sobre la proyección SIN SALTOS DE LÍNEA, con un mapa de índices de
+    # vuelta al original. **Esto no es cosmético**: el stream crudo del PTY no
+    # trae newlines, pero el `response` lo reconstruye pyte, que WRAPEA a `cols`
+    # (2000) e inserta un '\n' — y ese newline rompe la periodicidad. Medido
+    # sobre el job 65993 real: el history de 2381 chars queda como
+    # [2000, 380] y su período mínimo salta de 9 a 2008 ⇒ sin esta proyección el
+    # detector anda en `capturar()` pero NO en `shape_salida()`, y el recorte del
+    # response no se aplica nunca. Ver `replay_real.py` del test.
+    if "\n" in texto or "\r" in texto:
+        compacto_chars, mapa = [], []
+        for idx, ch in enumerate(texto):
+            if ch not in "\r\n":
+                compacto_chars.append(ch)
+                mapa.append(idx)
+        compacto = "".join(compacto_chars)
+    else:
+        compacto, mapa = texto, None
+
+    if len(compacto) < LOOP_MIN_CHARS:
+        return vacio
+
+    cola = compacto[-LOOP_VENTANA_CHARS:]
     p = _periodo_minimo(cola)
     if p <= 0 or p > LOOP_MAX_PERIODO:
         return vacio
@@ -361,14 +382,19 @@ def detectar_loop_degenerado(texto: str) -> dict:
     # Extender hacia atrás sobre el texto COMPLETO: el sufijo maximal con
     # período p. No se compara contra `unidad` porque el loop puede arrancar en
     # cualquier rotación — se compara char contra char a distancia p.
-    i = len(texto) - p
-    while i > 0 and texto[i - 1] == texto[i - 1 + p]:
+    i = len(compacto) - p
+    while i > 0 and compacto[i - 1] == compacto[i - 1 + p]:
         i -= 1
+
+    # `chars_loop` vuelve a coordenadas del ORIGINAL (incluye los newlines que
+    # caen dentro del tramo), para que `texto[:len(texto)-chars_loop]` corte
+    # justo donde arranca el loop.
+    inicio_orig = mapa[i] if mapa is not None else i
     return {
         "detectado": True,
         "unidad": cola[:p],
-        "repeticiones": (len(texto) - i) // p,
-        "chars_loop": len(texto) - i,
+        "repeticiones": (len(compacto) - i) // p,
+        "chars_loop": len(texto) - inicio_orig,
     }
 
 
