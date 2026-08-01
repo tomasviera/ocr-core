@@ -975,6 +975,24 @@ function _agyShapeRespuesta(
     $extras['citation_urls'] = (array_key_exists('citation_urls', $data) && is_array($data['citation_urls']))
         ? array_values(array_filter(array_map('strval', $data['citation_urls'])))
         : [];
+    // LOOP degenerado de salida (bump v31, 2026-07-31). El `.py` cortó la
+    // captura porque agy quedó repitiendo una unidad corta (`producing`) DESPUÉS
+    // de terminar de generar — bug del CLI, no del modelo. Semántica:
+    //   false → camino normal.
+    //   true + veredicto=TRANSITORIO → no quedaba nada rescatable; el worker
+    //     re-encola por el harness de `AgyTransitorioException`
+    //     (`transitorio_motivo='loop_salida_agy'`).
+    //   true + ok=true → SÍ quedaba transcripción: `response` viene ya SIN el
+    //     sufijo del loop y el worker inyecta el QA grave `looping`.
+    // `loop_chars_response` es cuánto se le recortó al `response` persistido;
+    // `loop_chars`/`loop_repeticiones` miden el stream crudo completo (forense).
+    // Core viejo (v≤30) no manda las claves → false/0 → no-op.
+    // Ver notas/motor_agy.md §"Bump v31".
+    $extras['loop_detectado']      = !empty($data['loop_detectado']);
+    $extras['loop_unidad']         = isset($data['loop_unidad']) ? (string) $data['loop_unidad'] : '';
+    $extras['loop_repeticiones']   = isset($data['loop_repeticiones']) ? (int) $data['loop_repeticiones'] : 0;
+    $extras['loop_chars']          = isset($data['loop_chars']) ? (int) $data['loop_chars'] : 0;
+    $extras['loop_chars_response'] = isset($data['loop_chars_response']) ? (int) $data['loop_chars_response'] : 0;
 
     // Token usage del statusLine side-channel (leído por el .py tras cerrar agy).
     // Si el setup manual del statusLine no se hizo, todos quedan en 0. A

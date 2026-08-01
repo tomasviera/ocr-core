@@ -85,6 +85,7 @@ se perdía todo + colgaba 300s; ahora viaja y agy se cierra por quiescencia.
     "longitud_sospechosa": bool,# response < UMBRAL (espejo de aistudio)
     "stdout_largo_sospechoso": bool,  # console_raw > UMBRAL_STDOUT_SOSPECHOSO
     "estado_captura": str,      # OK_FIN | QUIESCENT_NO_MARKER | TIMEOUT | PROC_EXIT | ERROR_SPAWN
+                                # | LOOP_DEGENERADO (v31: corte temprano por loop de salida)
     "duracion_seg": float,
     "bytes_leidos": int,
     "zombis_barridos": int,
@@ -181,6 +182,30 @@ UMBRAL_LONGITUD_SOSPECHOSA = 1000
 # emite los marcadores. Mientras agy trabaja, el spinner del TUI escribe
 # bytes continuos → last_byte_at se patea y este fallback no dispara.
 MIN_BYTES_PLAUSIBLES = 10 * 1024
+
+# ── Corte temprano por LOOP degenerado de salida (bump v31, 2026-07-31) ──────
+# agy (medido: SIEMPRE `Gemini 3.1 Pro (Low)`) entra a veces en un estado donde
+# la generación YA TERMINÓ pero el CLI queda escupiendo una palabra de estado
+# (`producing`) sin newline hasta que el timeout de 600s lo mata. Medición sobre
+# 35 casos reales en prensa (2026-06-29 → 2026-07-31, 32 con bundle forense):
+#   - el `agy_logfile.log` no tiene un solo `streamGenerateContent` después de
+#     ~t=26s; los 574s restantes son puro CLI colgado (cero cuota adicional),
+#   - el stream entero es la unidad repetida: sacándole "producing" al
+#     `raw_stripped` de 134 KB quedan 6 chars,
+#   - 30/35 clavaron el timeout; el `response` (fuente=history) se persistió como
+#     transcripción vigente → 31 páginas con ~135 KB de basura en `entradas`.
+#
+# La detección NO matchea el literal "producing": mide PERIODICIDAD degenerada
+# sobre la cola del stream (`_periodo_minimo`, función de fallo de KMP), así que
+# cubre cualquier token que agy repita en el futuro. Umbrales calibrados contra
+# los 278 bundles forenses archivados: 32/32 loops detectados, 0/246 corridas
+# sanas tocadas (test `temp/tests/2026-07-31_agy_loop_detector/`).
+LOOP_VENTANA_CHARS    = 20000   # cola del stream sobre la que se mide el período
+LOOP_MIN_CHARS        = 2000    # nada por debajo de esto se evalúa
+LOOP_MAX_PERIODO      = 48      # la unidad repetida tiene que ser CORTA
+LOOP_MIN_REPETICIONES = 200     # ...y repetirse muchas veces (≥ 200 × ≤48 chars)
+# Con estos valores el corte cae a ~t=45s (a t=45s hay ~4 KB acumulados) en vez
+# de t=600s. La generación real terminó a t≈26s ⇒ no se pierde nada.
 
 # Comando -i corto (plan §D + smoke validado): referencia @prompt.md + @imagen.jpg.
 # Evita el límite de 8191 chars del cmdline; el prompt completo está en el
@@ -286,6 +311,89 @@ def strip_ansi(s: str) -> str:
     return s
 
 
+def _periodo_minimo(s: str) -> int:
+    """Período mínimo de `s` vía la función de fallo de KMP.
+
+    Para "abcabcabc" devuelve 3; para un texto no periódico devuelve len(s).
+    O(n) en tiempo y memoria — con la ventana de 20k chars es despreciable
+    incluso corriendo una vez cada `progress_seg`.
+    """
+    n = len(s)
+    if n == 0:
+        return 0
+    fail = [0] * n
+    k = 0
+    for i in range(1, n):
+        while k and s[i] != s[k]:
+            k = fail[k - 1]
+        if s[i] == s[k]:
+            k += 1
+        fail[i] = k
+    return n - fail[n - 1]
+
+
+def detectar_loop_degenerado(texto: str) -> dict:
+    """¿La COLA de `texto` es una unidad corta repetida cientos de veces?
+
+    Firma del bug de agy documentado en §"Bump v31": el CLI queda escupiendo
+    una palabra de estado (`producing`) después de que la generación terminó.
+    Se mide sobre la cola —no sobre todo el texto— para atrapar también el caso
+    mixto (transcripción real y DESPUÉS el loop), que es donde `chars_loop`
+    marca dónde termina lo rescatable.
+
+    Devuelve siempre el mismo shape:
+      {'detectado': bool, 'unidad': str, 'repeticiones': int, 'chars_loop': int}
+    `unidad` es una ROTACIÓN cualquiera del token repetido (KMP no garantiza
+    cuál) — es forense, no se matchea contra nada.
+    """
+    vacio = {"detectado": False, "unidad": "", "repeticiones": 0, "chars_loop": 0}
+    if not texto or len(texto) < LOOP_MIN_CHARS:
+        return vacio
+
+    cola = texto[-LOOP_VENTANA_CHARS:]
+    p = _periodo_minimo(cola)
+    if p <= 0 or p > LOOP_MAX_PERIODO:
+        return vacio
+    reps_ventana = len(cola) // p
+    if reps_ventana < LOOP_MIN_REPETICIONES:
+        return vacio
+
+    # Extender hacia atrás sobre el texto COMPLETO: el sufijo maximal con
+    # período p. No se compara contra `unidad` porque el loop puede arrancar en
+    # cualquier rotación — se compara char contra char a distancia p.
+    i = len(texto) - p
+    while i > 0 and texto[i - 1] == texto[i - 1 + p]:
+        i -= 1
+    return {
+        "detectado": True,
+        "unidad": cola[:p],
+        "repeticiones": (len(texto) - i) // p,
+        "chars_loop": len(texto) - i,
+    }
+
+
+def _cola_para_loop(raw_parts: list, budget: Optional[int] = None) -> str:
+    """Últimos `budget` chars del stream, juntados desde los chunks del PTY.
+
+    Se recorre `raw_parts` de atrás para adelante acumulando por PRESUPUESTO DE
+    CHARS, no por cantidad de chunks. Es la parte contraintuitiva: en el bug
+    real agy escribe `producing` de a ~9 bytes, así que un `raw_parts[-N:]` con
+    N fijo devolvería unos cientos de chars —por debajo de LOOP_MIN_CHARS— y el
+    detector no dispararía NUNCA. Costo acotado: sólo se tocan los chunks
+    necesarios para llenar el presupuesto, una vez cada `progress_seg`.
+    """
+    if budget is None:
+        budget = 4 * LOOP_VENTANA_CHARS
+    piezas, acum = [], 0
+    for pedazo in reversed(raw_parts):
+        piezas.append(pedazo)
+        acum += len(pedazo)
+        if acum >= budget:
+            break
+    piezas.reverse()
+    return "".join(piezas)[-budget:]
+
+
 def extract_between(text: str, ini: str, fin: str) -> Optional[str]:
     """Texto entre el ÚLTIMO `ini` y el ÚLTIMO `fin` posterior a ese `ini`."""
     i = text.rfind(ini)
@@ -339,7 +447,8 @@ def _screen_text(screen: "pyte.Screen") -> str:
 
 @dataclass
 class CaptureResult:
-    estado: str                       # OK_FIN | QUIESCENT_NO_MARKER | TIMEOUT | PROC_EXIT | ERROR_SPAWN
+    estado: str                       # OK_FIN | QUIESCENT_NO_MARKER | TIMEOUT | PROC_EXIT
+                                      # | ERROR_SPAWN | LOOP_DEGENERADO (v31)
     fin_visto: bool
     duracion_seg: float
     bytes_leidos: int
@@ -367,6 +476,14 @@ class CaptureResult:
     # TRANSITORIO y el worker lo reintenta (cap) en vez de fail-fast a ERROR.
     transitorio_detectado: bool = False
     transitorio_motivo: str = ""
+    # LOOP degenerado de salida (bump v31): agy quedó repitiendo una unidad
+    # corta (`producing`) después de terminar de generar. Lo puebla el tick de
+    # progreso de `capturar()` vía `detectar_loop_degenerado`; cuando dispara,
+    # el estado de cierre es "LOOP_DEGENERADO" (no TIMEOUT).
+    loop_detectado: bool = False
+    loop_unidad: str = ""
+    loop_repeticiones: int = 0
+    loop_chars: int = 0
 
 
 def capturar(
@@ -538,12 +655,38 @@ def capturar(
                 res.estado = "QUIESCENT_NO_MARKER"
                 break
 
-            if verbose and (now - last_tick) >= progress_seg:
+            if (now - last_tick) >= progress_seg:
                 last_tick = now
-                cand = "sí" if candidato_at is not None else "no"
-                print(f"  [capturar] t={int(now - t0)}s bytes={total_bytes} "
-                      f"candidato={cand} alive={proc.isalive()}",
-                      file=sys.stderr, flush=True)
+                if verbose:
+                    cand = "sí" if candidato_at is not None else "no"
+                    print(f"  [capturar] t={int(now - t0)}s bytes={total_bytes} "
+                          f"candidato={cand} alive={proc.isalive()}",
+                          file=sys.stderr, flush=True)
+
+                # ── Corte temprano por LOOP degenerado (bump v31) ────────────
+                # Mismo tick que el progreso: una sola pasada cada
+                # `progress_seg`, sobre la COLA del stream (no sobre los 134 KB
+                # completos) para que el costo no crezca con la duración.
+                # `strip_ansi` sobre el último tramo puede cortar una secuencia
+                # de escape por la mitad: inocuo (a lo sumo deja basura al
+                # inicio de la ventana, que el período ignora).
+                #
+                # Gate `candidato_at is None`: si YA vimos FIN_MARKER, el cierre
+                # por OK_FIN va a ganar en ≤ fin_grace_seg y no hay nada que
+                # ahorrar — no le pisamos el camino feliz.
+                if candidato_at is None and total_bytes >= LOOP_MIN_CHARS:
+                    info_loop = detectar_loop_degenerado(
+                        strip_ansi(_cola_para_loop(raw_parts)))
+                    if info_loop["detectado"]:
+                        res.loop_detectado    = True
+                        res.loop_unidad       = info_loop["unidad"]
+                        res.loop_repeticiones = info_loop["repeticiones"]
+                        res.estado = "LOOP_DEGENERADO"
+                        print(f"  [capturar] LOOP degenerado detectado a t={int(now - t0)}s "
+                              f"(unidad={info_loop['unidad']!r} reps≥{info_loop['repeticiones']}) "
+                              f"→ cierro agy sin esperar el timeout",
+                              file=sys.stderr, flush=True)
+                        break
 
         res.duracion_seg = round(time.monotonic() - t0, 2)
         if candidato_at is None:
@@ -566,6 +709,18 @@ def capturar(
     res.console_raw = "".join(raw_parts)
     res.raw_stripped = strip_ansi(res.console_raw)
     res.bytes_leidos = total_bytes
+
+    # Medición definitiva del loop sobre el stream COMPLETO (el corte de arriba
+    # se decide sobre la cola, que es una muestra). Sólo forense: alimenta
+    # metrics.json / el stderr. La decisión "¿queda algo rescatable?" NO se toma
+    # acá sino en `shape_salida`, sobre el `response` que se iría a persistir.
+    if res.loop_detectado:
+        _info_final = detectar_loop_degenerado(res.raw_stripped)
+        if _info_final["detectado"]:
+            res.loop_unidad       = _info_final["unidad"]
+            res.loop_repeticiones = _info_final["repeticiones"]
+            res.loop_chars        = _info_final["chars_loop"]
+
     return res
 
 
@@ -2134,6 +2289,21 @@ def decidir_veredicto(res: CaptureResult) -> tuple:
                  f"[estado={res.estado} exit={res.exitstatus}]"),
                 False, "vacio")
 
+    # 3.6) LOOP degenerado que además dejó el grid VACÍO (bump v31). El camino
+    #      normal del loop no pasa por acá: el history trae el stream repetido
+    #      (≥ MIN_CONTENT_LEN) y sale por la rama 2, que es donde `shape_salida`
+    #      lo procesa. Esta rama es la defensiva — si pyte no reconstruyó nada,
+    #      el resultado sigue siendo "agy se colgó repitiendo", que es
+    #      REINTENTABLE, no un ERROR terminal. Sin esto caería al `else` de la
+    #      rama 4 como `sin_datos_utiles` y la página moriría sin reintento.
+    if getattr(res, "loop_detectado", False):
+        return ("TRANSITORIO", "",
+                (f"loop_salida_agy: agy quedó repitiendo "
+                 f"{(getattr(res, 'loop_unidad', '') or '?')!r} y no dejó nada "
+                 f"utilizable en el grid [estado={res.estado} "
+                 f"dur={res.duracion_seg}s]"),
+                False, "vacio")
+
     # 4) Genuino fallo: nada utilizable en el grid.
     err_parts = []
     if res.estado == "TIMEOUT":
@@ -2176,6 +2346,75 @@ def shape_salida(
     """
     veredicto, response, error, fin_presente, fuente_response = decidir_veredicto(res)
     ok = (veredicto == "OK")
+
+    # ── LOOP DEGENERADO DE SALIDA (bump v31) ──────────────────────────────────
+    # `capturar()` cortó porque agy quedó repitiendo una unidad corta. Acá se
+    # decide qué hacer con lo capturado, sobre el `response` REAL (el que se
+    # persistiría), no sobre el stream crudo:
+    #
+    #   1) Se le saca al `response` el sufijo periódico. Es chrome del CLI, no
+    #      output del modelo: en los 35 casos medidos el `agy_logfile.log` no
+    #      tiene un `streamGenerateContent` posterior al arranque del loop.
+    #   2) Si lo que queda NO llega a UMBRAL_LONGITUD_SOSPECHOSA ⇒ no hay nada
+    #      rescatable (35/35 de los casos observados: quedaban ≤ 6 chars) ⇒
+    #      veredicto=TRANSITORIO y el worker RE-ENCOLA. Evidencia de que sirve:
+    #      las 2 páginas que se re-encolaron a mano salieron OK al reintento
+    #      (edi 4404 p1 y 4445 p2, 175s y 144s).
+    #   3) Si queda una transcripción de largo plausible ⇒ se persiste SIN el
+    #      loop, con `loop_detectado=true` para que el worker inyecte el QA
+    #      grave `looping`. Que salten los demás motivos que tengan que saltar.
+    #
+    # EXCEPCIÓN EXPLÍCITA AL INVARIANTE de v19 ("sólo se reintenta lo que NO
+    # consumió cuota"): acá agy SÍ llamó al LLM (4 `streamGenerateContent` en el
+    # caso testigo, 408 tokens de output). Se reintenta igual porque (a) es
+    # esporádico y el reintento funciona, (b) el consumo es marginal frente a
+    # los ~9,5 min de slot que se ahorran, (c) el cap de 3 acota el peor caso.
+    # Si tocás `_agy_reintentos` o `agyAccionResultado`, tené presente que este
+    # motivo NO cumple el gate de `streamGenerateContent`.
+    #
+    # Sólo se recorta el sufijo periódico: es la forma observada (generación
+    # primero, loop después). Un loop EN EL MEDIO sobreviviría al recorte, pero
+    # `loop_detectado` viaja igual ⇒ el QA grave lo marca y la página va a
+    # revisión. Ver notas/motor_agy.md §"Bump v31".
+    loop_detectado    = bool(getattr(res, "loop_detectado", False))
+    loop_chars_resp   = 0
+    loop_unidad       = str(getattr(res, "loop_unidad", "") or "")
+    firma_loop        = None   # → firma_transitorio_motivo_forzado, ver abajo
+    if ok and loop_detectado:
+        _info_resp = detectar_loop_degenerado(response)
+        if _info_resp["detectado"]:
+            loop_chars_resp = _info_resp["chars_loop"]
+            loop_unidad     = _info_resp["unidad"] or loop_unidad
+            response = response[: len(response) - loop_chars_resp].rstrip()
+        if len(response.strip()) < UMBRAL_LONGITUD_SOSPECHOSA:
+            # Nada rescatable. NO devolvemos el stream de basura como
+            # `response`: el worker lo escribiría tal cual en
+            # `api_calls.api_rawresponse` (una vez por reintento). El raw
+            # completo queda en `stdout_raw` y en el bundle forense archivado.
+            response = (
+                f"[loop_salida_agy] {loop_chars_resp} chars de la unidad "
+                f"{loop_unidad!r} repetida; sin contenido rescatable. "
+                f"Raw completo en el bundle debug de esta corrida."
+            )
+            ok = False
+            veredicto = "TRANSITORIO"
+            error = (
+                f"loop_salida_agy: agy quedó repitiendo {loop_unidad!r} "
+                f"({getattr(res, 'loop_repeticiones', 0)} repeticiones, "
+                f"{getattr(res, 'loop_chars', 0)} chars) tras terminar de generar; "
+                f"captura cortada a los {res.duracion_seg}s sin esperar el timeout. "
+                f"Sin nada rescatable → reintentable"
+            )
+        else:
+            error = None
+
+    # Etiqueta del reintento. Cubre las DOS vías por las que un loop llega a
+    # TRANSITORIO: el bloque de arriba (había stream pero nada rescatable) y la
+    # rama 3.6 defensiva de `decidir_veredicto` (el grid quedó vacío). Sin esto
+    # la segunda vía llegaría al worker con `transitorio_motivo` vacío.
+    if loop_detectado and veredicto == "TRANSITORIO":
+        firma_loop = "loop_salida_agy"
+
     longitud_sospechosa = (
         ok and 0 < len(response) < UMBRAL_LONGITUD_SOSPECHOSA
     )
@@ -2213,8 +2452,12 @@ def shape_salida(
     # - veredicto=TRANSITORIO ya está mapeado por lib_worker_policy.php
     #   (agyAccionResultado → RETRY → AgyTransitorioException).
     resp_stripped = (response or "").strip()
-    firma_transitorio_motivo_forzado = None
-    firma_detectada = None
+    # v31: el bloque de loop degenerado corre ANTES que este desambigüe y puede
+    # haber forzado ya veredicto=TRANSITORIO. Se siembran las dos variables con
+    # su resultado (None si no hubo loop) en vez de pisarlas con None — si no,
+    # el motivo se perdería y el worker reintentaría sin etiqueta.
+    firma_transitorio_motivo_forzado = firma_loop
+    firma_detectada = "F_loop_salida_agy" if firma_loop else None
     if ok and resp_stripped.startswith("jetski:"):
         m = re.search(r'required the "([^"]+)" permission', resp_stripped)
         tool_denegada = m.group(1) if m else "desconocida"
@@ -2399,6 +2642,20 @@ def shape_salida(
         #             recitación enmascarada. **NO es evidencia de acceso web.**
         # Ver notas/bloqueo_qa_recurrente.md §"Evidencia forense".
         "citation_urls": list(getattr(res, "citation_urls", None) or []),
+        # LOOP degenerado de salida (bump v31, 2026-07-31). agy quedó repitiendo
+        # una unidad corta después de terminar de generar (ver §"Bump v31").
+        #   loop_detectado=False → camino normal, el resto de las claves en 0/"".
+        #   loop_detectado=True + veredicto=TRANSITORIO → no quedaba nada
+        #     rescatable; el worker re-encola (motivo `loop_salida_agy`).
+        #   loop_detectado=True + ok=True → SÍ quedaba transcripción: `response`
+        #     ya viene SIN el sufijo del loop y el worker inyecta el QA grave
+        #     `looping`. `loop_chars_response` dice cuánto se recortó.
+        # Consumidor viejo (lib_agy.php ≤ v30) ignora estas claves → no-op.
+        "loop_detectado":        bool(loop_detectado),
+        "loop_unidad":           loop_unidad,
+        "loop_repeticiones":     int(getattr(res, "loop_repeticiones", 0) or 0),
+        "loop_chars":            int(getattr(res, "loop_chars", 0) or 0),
+        "loop_chars_response":   int(loop_chars_resp),
         "fecha_iso": datetime.now().isoformat(timespec='seconds'),
     }
 
@@ -2834,6 +3091,15 @@ def main() -> int:
             "ok": out["ok"],
             "longitud_sospechosa": out["longitud_sospechosa"],
             "stdout_largo_sospechoso": out["stdout_largo_sospechoso"],
+            # v31: loop degenerado de salida (ver §"Bump v31"). `chars_response`
+            # es lo que se le recortó al `response` persistido.
+            "loop": {
+                "detectado":      out["loop_detectado"],
+                "unidad":         out["loop_unidad"],
+                "repeticiones":   out["loop_repeticiones"],
+                "chars":          out["loop_chars"],
+                "chars_response": out["loop_chars_response"],
+            },
             "len_response": len(out["response"] or ""),
             "len_extracted_screen": len(res.extracted_screen or ""),
             "len_extracted_history": len(res.extracted_history or ""),
@@ -2865,7 +3131,11 @@ def main() -> int:
         f"tools={len(tools_used)} statusln={out['statusline_disponible']} "
         f"tok_in={out['tokens_input']} tok_out={out['tokens_output']} "
         f"len_resp={len(out['response'] or '')} dur={out['duracion_seg']}s "
-        f"zombis={zombis}\n"
+        f"zombis={zombis}"
+        + (f" LOOP(unidad={out['loop_unidad']!r} reps={out['loop_repeticiones']} "
+           f"chars={out['loop_chars']} recortados={out['loop_chars_response']})"
+           if out["loop_detectado"] else "")
+        + "\n"
     )
     return 0
 
