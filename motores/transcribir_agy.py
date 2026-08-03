@@ -2091,6 +2091,61 @@ def _detectar_arranque_transitorio(res: "CaptureResult",
     return (False, "")
 
 
+# ── Forense del `--log-file` para el desambigüe de `executor_terminated` (v33) ─
+# Patrones de sub-causa: agy deja la causa raíz en el log, pero hasta v32 no
+# viajaba a ningún lado. El `error` que compone shape_salida enumeraba
+# sub-causas "habituales" a mano, así que `api_errorlog` no decía cuál de ellas
+# había ocurrido y había que abrir el bundle para saberlo.
+_RE_SUBCAUSA_GENERADOR = re.compile(r"error in generator:\s*(.+)", re.I)
+_RE_SUBCAUSA_PLANNER   = re.compile(r"processing planner output:\s*(.+)", re.I)
+_RE_SUBCAUSA_PRINTMODE = re.compile(r"run ended with error[^:]*:\s*(.+)", re.I)
+# Pistas complementarias: solas no explican el fallo, pero acotan mucho el
+# diagnóstico. La de `media has no inline data` fue la firma del incidente del
+# 2026-08-03 (INVALID_ARGUMENT 400 determinístico del backend).
+_PISTAS_LOG = (
+    "media has no inline data",
+    "unauthenticated",
+    "permission_denied",
+    "model unreachable",
+    "resource_exhausted",
+)
+
+
+def _forense_arranque(agy_log_path) -> dict:
+    """Lee el `--log-file` UNA vez y devuelve lo que necesitan el gate de
+    reintento y el mensaje de error.
+
+    - `hubo_generacion`: True si el log tiene `streamGenerateContent` — agy
+      llamó al LLM ⇒ consumió cuota ⇒ el fallo NO es "de arranque". **None** si
+      el log es ilegible o no existe: no se puede afirmar nada, y los callers
+      tratan None como "no sé" (conservador = comportamiento histórico).
+    - `subcausa`: la causa raíz que agy dejó en el log, recortada, para que
+      viaje dentro del `error` hasta `api_errorlog`.
+    """
+    out = {"hubo_generacion": None, "subcausa": ""}
+    try:
+        if not agy_log_path or not Path(agy_log_path).is_file():
+            return out
+        txt = Path(agy_log_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return out  # lockeado/ausente → gate no verificable
+
+    out["hubo_generacion"] = (_MARCA_GENERACION in txt.lower())
+
+    partes = []
+    for rx in (_RE_SUBCAUSA_GENERADOR, _RE_SUBCAUSA_PLANNER, _RE_SUBCAUSA_PRINTMODE):
+        m = rx.search(txt)
+        if m:
+            partes.append(m.group(1).strip()[:200])
+            break
+    bajo = txt.lower()
+    pistas = [p for p in _PISTAS_LOG if p in bajo]
+    if pistas:
+        partes.append("pistas: " + ", ".join(pistas))
+    out["subcausa"] = " | ".join(partes)[:400]
+    return out
+
+
 # ============================================================
 # TOKEN USAGE — side-channel statusLine (plan #3 §5)
 # ============================================================
@@ -2497,16 +2552,48 @@ def shape_salida(
             f"el prompt para que el modelo no invoque esa tool"
         )
     elif ok and resp_stripped == "Error: Agent execution terminated due to error.":
-        firma_detectada = "B_executor_terminated"
-        ok = False
-        veredicto = "TRANSITORIO"
-        firma_transitorio_motivo_forzado = "executor_terminated_prearranque"
-        error = (
-            "agy_terminado_prearranque: response literal 'Error: Agent execution "
-            "terminated due to error.' (agy salió antes de generar). Sub-causas "
-            "habituales en debug/agy_logfile.log: 'neither PlanModel nor RequestedModel', "
-            "UNAUTHENTICATED (401), 'model unreachable' (red), HTTP 502. Reintentable"
-        )
+        # ── B: executor terminated. SE PARTE EN DOS (bump v33, 2026-08-03) ────
+        # Hasta v32 esta rama forzaba TRANSITORIO a secas, saltándose el gate
+        # duro de v19 ("sólo se reintenta lo que NO llamó al LLM"). La etiqueta
+        # `prearranque` era una AFIRMACIÓN no verificada, y el 2026-08-03 se
+        # demostró falsa: el backend empezó a devolver INVALID_ARGUMENT (400)
+        # DESPUÉS de 2-3 `streamGenerateContent` (403 tokens de output, 31 k
+        # totales por corrida). Como el fallo era determinístico, el reintento
+        # repetía el gasto exacto: 724 jobs × 3 = 2176 corridas idénticas, ~15 h
+        # de slot y la cola entera quemada.
+        #
+        # El gate ahora se consulta de verdad:
+        #   - sin `streamGenerateContent`  → TRANSITORIO (comportamiento v25).
+        #   - CON `streamGenerateContent`  → ERROR terminal: hubo consumo, y un
+        #     fallo posterior a la generación no se arregla reintentando.
+        #   - log ilegible (None)          → TRANSITORIO (conservador = status quo).
+        _hubo_gen = getattr(res, "hubo_generacion", None)
+        _subcausa = (getattr(res, "subcausa_log", "") or "").strip()
+        _sub_txt  = f" Sub-causa del log: {_subcausa}." if _subcausa else ""
+        if _hubo_gen:
+            firma_detectada = "B2_executor_terminated_postgen"
+            ok = False
+            veredicto = "ERROR"
+            error = (
+                "executor_terminated_postgen: agy llegó a llamar a "
+                "streamGenerateContent (hubo generación y consumo de cuota) y "
+                "RECIÉN DESPUÉS murió con 'Agent execution terminated due to "
+                "error.'. NO es un fallo de arranque: reintentar repite el gasto "
+                "sin cambiar el resultado. Terminal — mirar la sub-causa y el "
+                "bundle forense." + _sub_txt
+            )
+        else:
+            firma_detectada = "B_executor_terminated"
+            ok = False
+            veredicto = "TRANSITORIO"
+            firma_transitorio_motivo_forzado = "executor_terminated_prearranque"
+            error = (
+                "agy_terminado_prearranque: response literal 'Error: Agent execution "
+                "terminated due to error.' y el log NO tiene streamGenerateContent "
+                "(agy salió antes de generar → sin consumo de cuota). Sub-causas "
+                "habituales: 'neither PlanModel nor RequestedModel', UNAUTHENTICATED "
+                "(401), 'model unreachable' (red), HTTP 502. Reintentable." + _sub_txt
+            )
     elif ok and ("eligibility check failed" in resp_stripped[:200].lower()
                  and "resource_exhausted" in resp_stripped.lower()):
         # E. eligibility check 429 (bump v29). agy muere en el chequeo de
@@ -2997,6 +3084,18 @@ def main() -> int:
     # (cap) en vez de fail-fast a ERROR. Gate duro dentro del helper: si hubo
     # `streamGenerateContent`, NO es transitorio (posible cuota → ERROR). No
     # aplica si ya se detectó cuota (decidir_veredicto prioriza CUOTA).
+    # Forense del log (v33): se lee UNA vez y se cuelga de `res` para que
+    # `shape_salida` pueda distinguir un fallo pre-generación de uno
+    # post-generación sin volver a abrir el archivo.
+    try:
+        _forense = _forense_arranque(agy_log_path)
+        res.hubo_generacion = _forense["hubo_generacion"]
+        res.subcausa_log    = _forense["subcausa"]
+    except Exception as _e:
+        res.hubo_generacion = None
+        res.subcausa_log    = ""
+        sys.stderr.write(f"[agy] WARN _forense_arranque: {_e}\n")
+
     try:
         _trans, _motivo = _detectar_arranque_transitorio(res, agy_log_path)
         if _trans:
