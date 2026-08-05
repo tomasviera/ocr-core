@@ -23,7 +23,21 @@ Lo invoca PHP (`web/includes/lib_agy.php`) desde un sandbox PRE-TRUSTED en
       [--home-dir C:/Users/Tomas/.gemini] \\
       [--modelo-agy "Gemini 3.5 Flash (Low)"] \\
       [--timeout 300] \\
-      [--cmd-mode interactive|print]   # print = -p (markdown crudo, sin inflar tablas)
+      [--cmd-mode interactive|print|paste]
+          # print = -p (markdown crudo, sin inflar tablas)
+          # paste = TUI sin -i/-p con la imagen adjuntada por PORTAPAPELES
+          #         (bump v34). WORKAROUND TEMPORAL del bug upstream agy #735
+          #         (LS 1.1.10 manda `inline_data` de longitud 0 cuando el
+          #         modelo abre una imagen con view_file → INVALID_ARGUMENT
+          #         400): el paste adjunta la imagen como media del mensaje y
+          #         evita el converter roto.
+          #         https://github.com/google-antigravity/antigravity-cli/issues/735
+          #         En este modo el texto se lee de la .db de conversación
+          #         (`fuente_response="db"`), NO de la pantalla: el TUI
+          #         renderiza el markdown y destruye los tags
+          #         `<ilegible>`/`<dudoso>` que el prompt exige.
+          #         Si el bug se arregla upstream: evaluar volver a 'print' y
+          #         re-verificar fuente db, señal imagen_cargada, chip y cols.
 
 El bundle forense (`console_raw`, `history_text`, `extracted_*`, `metrics.json`,
 `agy_logfile.log`) se escribe SIEMPRE en `<workdir_efímero>/debug/`, ok o !ok.
@@ -58,6 +72,8 @@ se perdía todo + colgaba 300s; ahora viaja y agy se cierra por quiescencia.
                                 #   3) screen_snapshot
                                 #   4) ""
     "fuente_response": str,     # "ini_fin" | "ini_only" | "history" | "screen" | "vacio"
+                                # | "db" (v34, sólo cmd_mode=paste: el texto sale
+                                #   de la conversation.db, con los tags intactos)
     "error": str|null,
     "veredicto": "OK"|"ERROR"|"CUOTA",
     "engine": "agy",
@@ -86,6 +102,16 @@ se perdía todo + colgaba 300s; ahora viaja y agy se cierra por quiescencia.
     "stdout_largo_sospechoso": bool,  # console_raw > UMBRAL_STDOUT_SOSPECHOSO
     "estado_captura": str,      # OK_FIN | QUIESCENT_NO_MARKER | TIMEOUT | PROC_EXIT | ERROR_SPAWN
                                 # | LOOP_DEGENERADO (v31: corte temprano por loop de salida)
+                                # | PASTE_SIN_CHIP (v34: el adjunto no apareció en el
+                                #   TUI ⇒ NO se envió el mensaje ⇒ cero cuota ⇒
+                                #   veredicto TRANSITORIO, motivo `paste_sin_chip`)
+    # extras del modo paste (v34). Siempre presentes, con default, para no romper
+    # consumidores viejos; en interactive/print valen False/0/None.
+    "paste_chip_detectado": bool,
+    "paste_reintentos": int,
+    "clipboard_restaurado": bool,
+    "media_en_log": int|None,   # `media=N` del --log-file; ≥1 = la imagen viajó
+                                # como media del mensaje del usuario
     "duracion_seg": float,
     "bytes_leidos": int,
     "zombis_barridos": int,
@@ -123,6 +149,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -212,6 +239,66 @@ LOOP_MIN_REPETICIONES = 200     # ...y repetirse muchas veces (≥ 200 × ≤48 
 # archivo dentro del sandbox.
 CMD_I_DEFAULT = ("Transcribí la imagen @imagen.jpg siguiendo al pie de la letra "
                  "las instrucciones de @prompt.md. No uses búsqueda web.")
+
+# ── MODO `paste` (bump v34, 2026-08-05) ──────────────────────────────────────
+# WORKAROUND TEMPORAL — bug upstream agy #735 (LS 1.1.10 manda inline_data
+# vacío cuando el modelo abre una imagen con view_file → INVALID_ARGUMENT 400).
+# https://github.com/google-antigravity/antigravity-cli/issues/735
+# El paste del TUI adjunta la imagen como media del mensaje y evita el
+# converter roto. Si el bug se arregla upstream: evaluar volver a cmd_mode
+# 'print' (markdown crudo sin TUI, sin tocar el portapapeles) y re-verificar
+# los subsistemas tocados (fuente db, señal imagen_cargada, chip, cols).
+#
+# Todas las constantes de abajo salen CALIBRADAS del test que validó la
+# mecánica contra agy real: `temp/tests/2026-08-03_170000_agy_tui_paste_media/`
+# (corrida `B_real_file_ctrlv`: media=1, 2,8 MB adjuntos, 26.808 chars).
+PASTE_COLS, PASTE_ROWS = 220, 80        # el TUI pinta cajas: ancho realista, no 2000
+PASTE_READY_QUIESCENT_SEG   = 5.0
+PASTE_READY_TIMEOUT_SEG     = 150.0     # cold start de agy puede ir a ~80 s
+PASTE_ESPERA_POST_TECLA_SEG = 5.0       # espera fija tras Ctrl+V antes de drenar
+PASTE_CHIP_QUIESCENT_SEG    = 3.0
+PASTE_CHIP_TIMEOUT_SEG      = 25.0
+PASTE_RESP_QUIESCENT_SEG    = 30.0
+PASTE_RESP_GRACIA_SEG       = 5.0       # tras ver FIN, esperar bytes estables
+PASTE_CIERRE_QUIESCENT_SEG  = 3.0
+PASTE_CIERRE_TIMEOUT_SEG    = 12.0
+PASTE_DELAY_ANTES_ENTER_SEG = 0.8       # que el TUI pinte el texto antes del \r
+PASTE_MAX_REINTENTOS_CHIP   = 1         # 1 reintento del par (clipboard, Ctrl+V)
+PASTE_PS_TIMEOUT_SEG        = 60        # timeout de cada invocación del .ps1
+# Presupuesto TOTAL de la captura. `capturar()` usa `timeout_seg` como total,
+# pero en paste las fases previas (READY hasta 150 s + chip + reintento) son
+# ADEMÁS del tiempo de generación. El wrapper PHP mata el subprocess a
+# `timeout_respuesta_seg + 120` (lib_agy.php `$procTimeout`), y un taskkill de
+# PHP deja el job sin `salida.json` (error genérico `proc_timeout`, sin
+# veredicto ni bundle completo). Para que eso no pase, la fase de respuesta se
+# recorta a lo que quede dentro de `timeout + PASTE_PRESUPUESTO_EXTRA_SEG`,
+# reservando el cierre. En el camino feliz (READY ~15-80 s) no recorta nada.
+PASTE_PRESUPUESTO_EXTRA_SEG = 90
+PASTE_RESERVA_CIERRE_SEG    = 20
+PASTE_RESP_TIMEOUT_MIN_SEG  = 30        # piso: nunca dejar la respuesta sin margen
+PASTE_KEY_CTRL_V = "\x16"               # pegar
+PASTE_KEY_CTRL_U = "\x15"               # limpiar la línea antes de reintentar
+# Script de portapapeles: vive AL LADO de este .py (viaja con el vendor).
+PASTE_CLIPBOARD_SCRIPT = "agy_clipboard.ps1"
+# Firma del chip de adjunto en el snapshot pyte. La línea real medida es:
+#   `  ▸ 📎 1 media attached (clipboard, 2.8 MB, image/png)  (ctrl+o to expand)`
+# Se exigen los DOS tokens en la MISMA línea: "media attached" solo podría venir
+# de texto pegado por el usuario, y "image/" solo aparece en cualquier mención
+# de mime. Juntos identifican el chip del TUI.
+PASTE_CHIP_TOKENS = ("media attached", "image/")
+# Texto CORTO que se tipea después del paste (el prompt largo lo lee el modelo
+# de disco). OJO: NADA de `@` — en el TUI la tecla `@` abre el menú interactivo
+# de menciones y el Enter final confirmaría el popup en vez de enviar (medido).
+PASTE_TEXTO_CORTO_TPL = (
+    "Lee el archivo prompt.md del directorio de trabajo ({sandbox}) y "
+    "transcribi la imagen adjunta siguiendo esas instrucciones."
+)
+# Línea del `--log-file` que dice cuántos medios viajaron con el mensaje del
+# usuario. La real intercala `to conversation <uuid>` entre medio, así que el
+# regex NO asume formato fijo ahí: `Forwarding user message to conversation
+# <uuid> (items=1, media=1)`.
+_RE_FORWARDING_MEDIA = re.compile(
+    r"Forwarding user message\b.*?\(items=(\d+),\s*media=(\d+)\)")
 
 # .agents/settings.json del sandbox (plan §D2 + smoke validado): SIN write_file
 # (no escribimos output.txt; leemos consola), deny defensivo de WebSearch
@@ -748,6 +835,651 @@ def capturar(
             res.loop_chars        = _info_final["chars_loop"]
 
     return res
+
+
+# ============================================================
+# MODO `paste` — captura TUI con la imagen adjuntada por portapapeles (v34)
+# ============================================================
+#
+# WORKAROUND TEMPORAL — bug upstream agy #735 (LS 1.1.10 manda inline_data
+# vacío cuando el modelo abre una imagen con view_file → INVALID_ARGUMENT 400).
+# https://github.com/google-antigravity/antigravity-cli/issues/735
+# El paste del TUI adjunta la imagen como media del mensaje y evita el
+# converter roto. Si el bug se arregla upstream: evaluar volver a cmd_mode
+# 'print' (markdown crudo sin TUI, sin tocar el portapapeles) y re-verificar
+# los subsistemas tocados (fuente db, señal imagen_cargada, chip, cols).
+#
+# Diferencias con `capturar()`, todas medidas en el test que validó la mecánica:
+#   - argv SIN `-i`/`-p`: si el mensaje se pasa por línea de comandos, agy lo
+#     envía ANTES de que podamos pegar y el adjunto no llega a viajar.
+#   - PTY 220×80: el TUI pinta cajas; con cols=2000 el chrome se deforma.
+#   - el TEXTO se tipea después del paste y NO lleva `@` (la tecla abre el menú
+#     de menciones y el Enter confirmaría el popup en vez de enviar).
+#   - la transcripción NO sale de la pantalla: el TUI renderiza el markdown y
+#     DESTRUYE los tags `<ilegible>`/`<dudoso>` (medido: 271 en la .db, 0 en el
+#     grid pyte). El texto sale de la .db (`_extraer_transcripcion_db`); el
+#     grid/history quedan sólo como evidencia forense en el bundle.
+
+
+def _ps_clipboard(args_ps: list, timeout: float = PASTE_PS_TIMEOUT_SEG) -> tuple:
+    """Invoca `agy_clipboard.ps1` (sibling de este .py) y devuelve
+    (returncode, stdout_bytes, stderr_str).
+
+    `-STA` es OBLIGATORIO: las APIs de portapapeles de WinForms sólo funcionan
+    en un apartment single-threaded. Best-effort: cualquier excepción
+    (timeout, powershell ausente) sale como rc=-1 con el detalle en stderr.
+    """
+    script = Path(__file__).resolve().parent / PASTE_CLIPBOARD_SCRIPT
+    cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-STA",
+           "-ExecutionPolicy", "Bypass", "-File", str(script)] + [str(a) for a in args_ps]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        return (r.returncode, r.stdout or b"",
+                (r.stderr or b"").decode("utf-8", "replace").strip())
+    except Exception as e:
+        return (-1, b"", f"{type(e).__name__}: {e}")
+
+
+def _chip_media_presente(snapshot: str) -> bool:
+    """¿El snapshot del TUI tiene la línea del chip de adjunto?
+
+    Exige los dos tokens de `PASTE_CHIP_TOKENS` en la MISMA línea. Es la red
+    anti-colisión con el usuario: si alguien copió algo en la ventana crítica
+    (el portapapeles es global), el Ctrl+V pegó SU contenido y esta firma NO
+    aparece → el .py reintenta y, si vuelve a fallar, cierra agy sin enviar
+    nada (cero cuota consumida).
+    """
+    for linea in (snapshot or "").split("\n"):
+        if all(tok in linea for tok in PASTE_CHIP_TOKENS):
+            return True
+    return False
+
+
+def _texto_corto_paste(sandbox_abs: str) -> str:
+    """Mensaje que se TIPEA en el TUI tras adjuntar la imagen. Sin ningún `@`
+    (ver el comentario de PASTE_TEXTO_CORTO_TPL)."""
+    return PASTE_TEXTO_CORTO_TPL.format(sandbox=sandbox_abs)
+
+
+def capturar_paste(
+    argv: list,
+    *,
+    imagen_path: str,
+    texto_corto: str,
+    cwd: Optional[str] = None,
+    env: Optional[dict] = None,
+    debug_dir: Optional[Path] = None,
+    cols: int = PASTE_COLS,
+    rows: int = PASTE_ROWS,
+    history_lines: int = 8000,
+    timeout_seg: float = 300.0,
+    ini_marker: str = INI_MARKER,
+    fin_marker: str = FIN_MARKER,
+    read_size: int = 4096,
+    verbose: bool = True,
+    progress_seg: float = 15.0,
+) -> CaptureResult:
+    """Abre el TUI de agy, pega `imagen_path` desde el portapapeles, tipea
+    `texto_corto` + Enter y espera la respuesta. Devuelve un `CaptureResult`.
+
+    Secuencia (calibrada en el test `2026-08-03_170000_agy_tui_paste_media`):
+      1) READY      — quiescencia 5 s (timeout 150 s: el cold start va a ~80 s).
+      2) CLIPBOARD  — backup del TEXTO previo → file-drop (CF_HDROP) → Ctrl+V
+                      INMEDIATO (la ventana en que el portapapeles del usuario
+                      está pisado tiene que ser mínima: es un recurso global y
+                      NO hay lock — hoy hay 1 solo slot agy por host).
+      3) CHIP       — espera fija 5 s + drenaje 3 s/25 s (`exigir_bytes=False`:
+                      el paste puede no repintar nada) y se busca la firma del
+                      adjunto. Verificado el chip se RESTAURA el portapapeles
+                      en el acto (no al final del job). Sin chip: Ctrl+U y un
+                      reintento; si vuelve a fallar → estado PASTE_SIN_CHIP y
+                      se cierra agy SIN ENVIAR NADA (cero cuota → reintentable).
+      4) ENVÍO      — texto corto + 0,8 s + Enter.
+      5) RESPUESTA  — marcador FIN + 5 s estables, o quiescencia de 30 s, o
+                      `timeout_seg`. Con el detector de loop degenerado (v32)
+                      en el tick de progreso: el stream del TUI es un PTY igual
+                      que el de `-p`.
+      6) CIERRE     — Ctrl+U + `/exit` → Ctrl+C ×2 → `_kill_arbol`. El barrido
+                      de zombis del LS detached lo hace `main()` después (mismo
+                      helper que los otros modos: acá duplicarlo desincronizaría
+                      el contador `zombis_barridos`). La corrida real cerró
+                      siempre por `/exit`.
+
+    Estados posibles: OK_FIN | QUIESCENT_NO_MARKER | TIMEOUT | PROC_EXIT |
+    ERROR_SPAWN | LOOP_DEGENERADO | PASTE_SIN_CHIP.
+
+    Atributos dinámicos que cuelga en el resultado (mismo gesto que
+    `imagen_cargada_ok`): `paste_chip_detectado`, `paste_reintentos`,
+    `clipboard_restaurado`, `paste_modo`.
+    """
+    res = CaptureResult(estado="ERROR_SPAWN", fin_visto=False,
+                        duracion_seg=0.0, bytes_leidos=0)
+    res.paste_modo = True
+    res.paste_chip_detectado = False
+    res.paste_reintentos = 0
+    res.clipboard_restaurado = False
+
+    plain = pyte.Screen(cols, rows)
+    plain_stream = pyte.Stream(plain)
+    hist = pyte.HistoryScreen(cols, rows, history=history_lines, ratio=0.5)
+    hist_stream = pyte.Stream(hist)
+
+    raw_parts: list = []
+    total_bytes = 0
+    t0 = time.monotonic()
+
+    def _log(msg: str) -> None:
+        if verbose:
+            sys.stderr.write(f"[agy-paste] {msg}\n")
+            sys.stderr.flush()
+
+    def _dump(nombre: str, contenido: str) -> None:
+        """Escribe un artefacto forense del paste al bundle. Best-effort."""
+        if debug_dir is None:
+            return
+        try:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            (debug_dir / nombre).write_text(contenido or "", encoding="utf-8")
+        except Exception as e:
+            sys.stderr.write(f"[agy-paste] WARN debug {nombre}: {e}\n")
+
+    try:
+        proc = winpty.PtyProcess.spawn(argv, cwd=cwd, env=env, dimensions=(rows, cols))
+    except Exception as e:
+        res.error = f"spawn: {type(e).__name__}: {e}"
+        return res
+    res.pid = getattr(proc, "pid", None)
+    _log(f"spawn OK pid={res.pid} argv={argv}")
+
+    q: "queue.Queue" = queue.Queue()
+    stop_flag = threading.Event()
+
+    def _reader():
+        while not stop_flag.is_set():
+            try:
+                ch = proc.read(read_size)
+            except EOFError:
+                q.put(None)
+                return
+            except Exception as e:
+                q.put(("__EXC__", f"{type(e).__name__}: {e}"))
+                return
+            if ch:
+                q.put(ch)
+            else:
+                if not proc.isalive():
+                    q.put(None)
+                    return
+                time.sleep(0.02)
+
+    reader = threading.Thread(target=_reader, name="conpty-paste-reader", daemon=True)
+    reader.start()
+
+    def _drenar(quiescent_seg: float, total_timeout: float, label: str,
+                exigir_bytes: bool = True, marcador: Optional[str] = None,
+                gracia: float = PASTE_RESP_GRACIA_SEG,
+                detectar_loop: bool = False) -> tuple:
+        """Drena hasta quiescencia (o marcador + gracia, o timeout).
+
+        Devuelve (ok, motivo) con motivo ∈ {QUIESCENT, MARCADOR, TIMEOUT,
+        PROC_EXIT, READER_EXC, LOOP}. `exigir_bytes=False` permite cerrar por
+        quiescencia aunque no haya llegado un solo byte nuevo — necesario tras
+        el paste, porque el TUI puede no repintar nada al adjuntar.
+        """
+        nonlocal total_bytes
+        local_t0 = time.monotonic()
+        last_byte = local_t0
+        last_tick = local_t0
+        bytes_at_entry = total_bytes
+        marcador_at = None
+        while True:
+            now = time.monotonic()
+            if now - local_t0 >= total_timeout:
+                _log(f"{label}: TIMEOUT t={int(now-local_t0)}s "
+                     f"bytes_nuevos={total_bytes-bytes_at_entry}")
+                return False, "TIMEOUT"
+            try:
+                item = q.get(timeout=0.2)
+                if item is None:
+                    _log(f"{label}: PROC_EXIT")
+                    return False, "PROC_EXIT"
+                if isinstance(item, tuple) and item and item[0] == "__EXC__":
+                    res.notas.append(f"read-exc: {item[1]}")
+                    _log(f"{label}: reader exc {item[1]}")
+                    return False, "READER_EXC"
+                raw_parts.append(item)
+                total_bytes += len(item)
+                last_byte = now
+                plain_stream.feed(item)
+                hist_stream.feed(item)
+                if marcador and marcador_at is None:
+                    if (marcador in _screen_text(plain)
+                            or marcador in _history_text(hist)):
+                        marcador_at = now
+                        _log(f"{label}: marcador visto a t={int(now-local_t0)}s")
+            except queue.Empty:
+                pass
+
+            nuevos = total_bytes - bytes_at_entry
+            if marcador_at is not None and (now - last_byte) >= gracia:
+                _log(f"{label}: MARCADOR + {gracia}s estables (bytes_nuevos={nuevos})")
+                return True, "MARCADOR"
+            if (now - last_byte) >= quiescent_seg and (nuevos > 0 or not exigir_bytes):
+                _log(f"{label}: QUIESCENT t={int(now-local_t0)}s bytes_nuevos={nuevos}")
+                return True, "QUIESCENT"
+
+            if (now - last_tick) >= progress_seg:
+                last_tick = now
+                _log(f"{label}: t={int(now-local_t0)}s bytes_nuevos={nuevos} "
+                     f"alive={proc.isalive()}")
+                # ── Corte temprano por LOOP degenerado (bump v31/v32) ────────
+                # Mismo gate que `capturar()`: si YA vimos el marcador, el
+                # cierre por MARCADOR gana en ≤ gracia y no hay nada que
+                # ahorrar. El stream del TUI es un PTY igual que el de `-p`, así
+                # que la firma (unidad corta repetida cientos de veces) aplica.
+                if (detectar_loop and marcador_at is None
+                        and total_bytes >= LOOP_MIN_CHARS):
+                    info_loop = detectar_loop_degenerado(
+                        strip_ansi(_cola_para_loop(raw_parts)))
+                    if info_loop["detectado"]:
+                        res.loop_detectado    = True
+                        res.loop_unidad       = info_loop["unidad"]
+                        res.loop_repeticiones = info_loop["repeticiones"]
+                        _log(f"LOOP degenerado detectado a t={int(now-local_t0)}s "
+                             f"(unidad={info_loop['unidad']!r} "
+                             f"reps≥{info_loop['repeticiones']}) → cierro agy")
+                        return False, "LOOP"
+
+    # ── Estado del portapapeles: se pisa lo MÍNIMO y se restaura SIEMPRE ──
+    backup_path = (debug_dir / "clipboard_previo.txt") if debug_dir is not None else None
+    clipboard_pisado = False
+
+    def _guardar_clipboard() -> None:
+        """Backup del TEXTO previo del portapapeles. Best-effort y sólo texto:
+        una imagen/lista de archivos ajena NO se puede preservar (queda
+        documentado en notas/motor_agy.md §Bump v34)."""
+        nonlocal backup_path
+        rc, out, err = _ps_clipboard(["-Mode", "get"])
+        txt = out.decode("utf-8", "replace") if rc == 0 else ""
+        if rc != 0:
+            _log(f"WARN clipboard get falló ({err}); sigo con backup vacío")
+        if backup_path is None:
+            # Sin debug_dir no hay dónde dejarlo: el .ps1 restaura desde archivo
+            # (evita quoting), así que cae a un temporal del sistema. NUNCA al
+            # sandbox: es el cwd de agy y tiene que quedar sólo con lo canónico.
+            backup_path = Path(tempfile.gettempdir()) / (
+                f"agy_clipboard_previo_{os.getpid()}.txt")
+        try:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            backup_path.write_text(txt, encoding="utf-8")
+        except Exception as e:
+            _log(f"WARN no pude escribir el backup del portapapeles: {e}")
+            backup_path = None
+        _log(f"portapapeles previo guardado ({len(txt)} chars)")
+
+    def _restaurar_clipboard() -> None:
+        nonlocal clipboard_pisado
+        if not clipboard_pisado:
+            return
+        if backup_path is None or not backup_path.is_file():
+            _log("WARN no hay backup del portapapeles para restaurar")
+            return
+        rc, _o, err = _ps_clipboard(["-Mode", "text", "-TextFile", str(backup_path)])
+        if rc == 0:
+            clipboard_pisado = False
+            res.clipboard_restaurado = True
+            _log("portapapeles restaurado")
+        else:
+            _log(f"WARN restauración del portapapeles falló: {err}")
+
+    def _pegar_imagen() -> bool:
+        """Pone el file-drop y manda Ctrl+V INMEDIATAMENTE. False si el .ps1
+        falló (en ese caso el portapapeles NO quedó pisado)."""
+        nonlocal clipboard_pisado
+        rc, _o, err = _ps_clipboard(["-Mode", "file", "-Path", imagen_path])
+        if rc != 0:
+            _log(f"WARN clipboard file-drop falló: {err}")
+            return False
+        clipboard_pisado = True
+        proc.write(PASTE_KEY_CTRL_V)
+        _log("file-drop puesto + Ctrl+V enviado")
+        return True
+
+    motivo_resp = None
+    try:
+        # ── FASE 1: TUI listo ──────────────────────────────────────────────
+        ok_ready, motivo_ready = _drenar(
+            PASTE_READY_QUIESCENT_SEG, PASTE_READY_TIMEOUT_SEG, "READY")
+        res.notas.append(f"ready:{motivo_ready}")
+        snap_pre = _screen_text(plain)
+        _dump("snapshot_pre_paste.txt", snap_pre)
+
+        if motivo_ready in ("PROC_EXIT", "READER_EXC"):
+            # agy murió antes de que pudiéramos pegar: nada que enviar, nada de
+            # cuota consumida. El estado lo interpreta decidir_veredicto.
+            res.estado = "PROC_EXIT"
+        else:
+            # Un TIMEOUT del READY no aborta: el TUI puede estar listo con el
+            # spinner de auth escribiendo. El chip es el que decide de verdad.
+            if not ok_ready:
+                _log(f"TUI no quedó quiescente ({motivo_ready}) — sigo igual, "
+                     f"el chip decide")
+
+            # ── FASE 2+3: portapapeles + Ctrl+V + verificación del chip ─────
+            _guardar_clipboard()
+            chip_ok = False
+            for intento in range(PASTE_MAX_REINTENTOS_CHIP + 1):
+                if intento > 0:
+                    res.paste_reintentos = intento
+                    _log(f"chip ausente → Ctrl+U y reintento {intento}/"
+                         f"{PASTE_MAX_REINTENTOS_CHIP}")
+                    try:
+                        proc.write(PASTE_KEY_CTRL_U)  # limpia lo que se haya pegado
+                    except Exception as e:
+                        _log(f"WARN Ctrl+U falló: {e}")
+                    time.sleep(0.5)
+                if not _pegar_imagen():
+                    continue
+                time.sleep(PASTE_ESPERA_POST_TECLA_SEG)
+                _drenar(PASTE_CHIP_QUIESCENT_SEG, PASTE_CHIP_TIMEOUT_SEG,
+                        "PASTE", exigir_bytes=False)
+                snap_post = _screen_text(plain)
+                # El reintento va a un archivo aparte: si se pisara, el bundle
+                # perdería la evidencia de POR QUÉ falló el primer paste.
+                _dump("snapshot_post_paste.txt" if intento == 0
+                      else f"snapshot_post_paste_reintento{intento}.txt", snap_post)
+                if _chip_media_presente(snap_post):
+                    chip_ok = True
+                    res.paste_chip_detectado = True
+                    _log("chip de adjunto DETECTADO")
+                    # Restaurar YA: el portapapeles del usuario no tiene por qué
+                    # quedar pisado durante los minutos que dura la generación.
+                    _restaurar_clipboard()
+                    break
+                _restaurar_clipboard()
+
+            if not chip_ok:
+                # Ni el paste ni el reintento adjuntaron nada (p. ej. el usuario
+                # copió algo en la ventana crítica y pegamos SU texto). Se cierra
+                # agy SIN ENVIAR NADA → cero cuota consumida → re-encolable,
+                # coherente con el invariante de v19.
+                res.estado = "PASTE_SIN_CHIP"
+                res.transitorio_detectado = True
+                res.transitorio_motivo = "paste_sin_chip"
+                _log("chip AUSENTE tras los reintentos → cierro sin enviar")
+            else:
+                # ── FASE 4: envío del texto corto ──────────────────────────
+                proc.write(texto_corto)
+                time.sleep(PASTE_DELAY_ANTES_ENTER_SEG)
+                proc.write("\r")
+                _log(f"mensaje enviado ({len(texto_corto)} chars)")
+
+                # ── FASE 5: respuesta ──────────────────────────────────────
+                # Presupuesto: `timeout_seg` completo salvo que las fases
+                # previas (cold start largo + reintento del chip) ya se hayan
+                # comido el margen que PHP nos da antes del taskkill. Ver
+                # PASTE_PRESUPUESTO_EXTRA_SEG.
+                _restante = (timeout_seg + PASTE_PRESUPUESTO_EXTRA_SEG
+                             - (time.monotonic() - t0) - PASTE_RESERVA_CIERRE_SEG)
+                _resp_timeout = max(PASTE_RESP_TIMEOUT_MIN_SEG,
+                                    min(timeout_seg, _restante))
+                if _resp_timeout < timeout_seg:
+                    _log(f"presupuesto recortado: la respuesta tiene "
+                         f"{int(_resp_timeout)}s (de {int(timeout_seg)}s) para no "
+                         f"comerse el margen del proc_timeout de PHP")
+                ok_resp, motivo_resp = _drenar(
+                    PASTE_RESP_QUIESCENT_SEG, _resp_timeout, "RESPUESTA",
+                    marcador=fin_marker, gracia=PASTE_RESP_GRACIA_SEG,
+                    detectar_loop=True)
+                res.notas.append(f"respuesta:{motivo_resp}")
+                if motivo_resp == "MARCADOR":
+                    res.estado = "OK_FIN"
+                elif motivo_resp == "QUIESCENT":
+                    res.estado = "QUIESCENT_NO_MARKER"
+                elif motivo_resp == "LOOP":
+                    res.estado = "LOOP_DEGENERADO"
+                elif motivo_resp in ("PROC_EXIT", "READER_EXC"):
+                    res.estado = "PROC_EXIT"
+                else:
+                    res.estado = "TIMEOUT"
+    except Exception as e:
+        res.error = f"paste: {type(e).__name__}: {e}"
+        res.notas.append(f"excepcion: {type(e).__name__}: {e}")
+        sys.stderr.write(f"[agy-paste] EXCEPCIÓN: {e}\n{traceback.format_exc()}")
+    finally:
+        # El portapapeles es global: restaurar pase lo que pase.
+        try:
+            _restaurar_clipboard()
+        except Exception as e:
+            _log(f"WARN restauración final falló: {e}")
+
+        # ── FASE 6: cierre en escalera (/exit → Ctrl+C ×2 → kill → barrido) ──
+        via = []
+        try:
+            if proc.isalive():
+                try:
+                    # Ctrl+U ANTES del /exit, SIEMPRE. En el camino feliz la
+                    # línea quedó vacía tras el envío y es un no-op; pero en
+                    # PASTE_SIN_CHIP puede haber quedado tipeado lo que el
+                    # paste metió en el input (p. ej. el texto que el usuario
+                    # tenía copiado) y entonces el Enter del `/exit` LO
+                    # ENVIARÍA como mensaje ⇒ consumo de cuota justo en el
+                    # camino que se declara "cero cuota". Barato y salva eso.
+                    proc.write(PASTE_KEY_CTRL_U)
+                    time.sleep(0.3)
+                    proc.write("/exit\r")
+                    via.append("ctrl-u+/exit")
+                    _drenar(PASTE_CIERRE_QUIESCENT_SEG, PASTE_CIERRE_TIMEOUT_SEG,
+                            "CIERRE", exigir_bytes=False)
+                except Exception as e:
+                    _log(f"WARN write /exit falló: {e}")
+            if proc.isalive():
+                try:
+                    proc.write("\x03")
+                    time.sleep(0.6)
+                    proc.write("\x03")
+                    via.append("ctrl-c x2")
+                    _drenar(PASTE_CIERRE_QUIESCENT_SEG, PASTE_CIERRE_TIMEOUT_SEG,
+                            "CIERRE2", exigir_bytes=False)
+                except Exception as e:
+                    _log(f"WARN ctrl-c falló: {e}")
+            if proc.isalive() and res.pid:
+                _kill_arbol(res.pid)
+                via.append("taskkill")
+        except Exception as e:
+            _log(f"WARN cierre: {e}")
+        finally:
+            stop_flag.set()
+            try:
+                res.exitstatus = proc.exitstatus
+            except Exception:
+                pass
+            try:
+                if proc.isalive():
+                    proc.terminate(force=True)
+                    via.append("terminate")
+            except Exception:
+                pass
+        res.notas.append("cierre:" + ("+".join(via) or "ya_muerto"))
+
+    res.duracion_seg = round(time.monotonic() - t0, 2)
+    res.console_raw  = "".join(raw_parts)
+    res.raw_stripped = strip_ansi(res.console_raw)
+    res.bytes_leidos = total_bytes
+    res.screen_snapshot = _screen_text(plain)
+    res.history_text    = _history_text(hist)
+    # El grid NO es la fuente del texto en paste (el TUI destruye los tags), pero
+    # se puebla igual: alimenta el bundle forense y deja comparable el modo paste
+    # con los otros dos.
+    res.partial_from_ini    = extract_from_last_ini(res.history_text, ini_marker, fin_marker)
+    res.extracted_history   = extract_between(res.history_text, ini_marker, fin_marker)
+    res.extracted_screen    = extract_between(res.screen_snapshot, ini_marker, fin_marker)
+    res.fin_visto = (fin_marker in res.history_text or fin_marker in res.screen_snapshot)
+
+    # Medición definitiva del loop sobre el stream COMPLETO (el corte se decide
+    # sobre la cola, que es una muestra). Sólo forense.
+    if res.loop_detectado:
+        _info_final = detectar_loop_degenerado(res.raw_stripped)
+        if _info_final["detectado"]:
+            res.loop_unidad       = _info_final["unidad"]
+            res.loop_repeticiones = _info_final["repeticiones"]
+            res.loop_chars        = _info_final["chars_loop"]
+
+    _dump("snapshot_final.txt", res.screen_snapshot)
+    return res
+
+
+def _extraer_transcripcion_db(db_path: Optional[str]) -> Optional[str]:
+    """Texto transcripto leído de la `.db` de conversación (bump v34).
+
+    WORKAROUND TEMPORAL — bug upstream agy #735: el modo `paste` existe para
+    esquivarlo, y en `paste` la pantalla NO sirve como fuente: el TUI renderiza
+    el markdown y DESTRUYE los tags `<ilegible>`/`<dudoso>` que el prompt de
+    producción exige (medido: 271 `<ilegible>` en la .db, 0 en el grid pyte),
+    además de wrapear la prosa a `cols`. https://github.com/google-antigravity/antigravity-cli/issues/735
+
+    Mecánica: del ÚLTIMO step con `step_type=15` (el de la respuesta final) se
+    decodifica `step_payload` como UTF-8 y se toma el PRIMER par
+    INICIO…FIN completo. El payload trae el texto DOS veces, idénticas (medido
+    en la corrida real y en dos bundles de `-p`): con el primer par alcanza.
+
+    Devuelve el segmento CON ambos marcadores (igual que `partial_from_ini`, que
+    es lo que PHP recorta en `parseAndInsertEntradas`), o None si no se pudo
+    leer la .db / no hay step 15 / no hay par completo. NUNCA cae a la pantalla:
+    persistir el render sería meter texto sin tags en la BD en silencio.
+    """
+    if not db_path:
+        return None
+    for attempt in range(3):
+        try:
+            uri = "file:" + str(db_path).replace("\\", "/") + "?mode=ro"
+            con = sqlite3.connect(uri, uri=True, timeout=2)
+            try:
+                rows = con.execute(
+                    "SELECT idx, step_payload FROM steps WHERE step_type = 15 "
+                    "ORDER BY idx"
+                ).fetchall()
+            finally:
+                con.close()
+            break
+        except Exception as e:
+            if attempt == 2:
+                sys.stderr.write(
+                    f"[agy] WARN _extraer_transcripcion_db: {type(e).__name__}: {e}\n")
+                return None
+            time.sleep(0.3)
+    if not rows:
+        return None
+    payload = rows[-1][1]
+    if payload is None:
+        return None
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8", "replace")
+    try:
+        txt = bytes(payload).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    i = txt.find(INI_MARKER)
+    if i == -1:
+        return None
+    j = txt.find(FIN_MARKER, i + len(INI_MARKER))
+    if j == -1:
+        return None
+    seg = txt[i:j + len(FIN_MARKER)]
+    return seg if len(seg) >= MIN_CONTENT_LEN else None
+
+
+def _png_en_gen_metadata(db_path: Optional[str]) -> Optional[bool]:
+    """¿Hay un PNG (magic `\\x89PNG`) en algún blob de `gen_metadata` (v34)?
+
+    Es la señal FUERTE de que la imagen viajó al modelo: es el binario que el
+    backend recibió, no el rastro del intento de la tool. Devuelve True/False,
+    o None si la tabla no existe / la .db no es legible (formato viejo →
+    "no verificable", y el caller cae al fallback).
+
+    Se itera fila por fila (los blobs pueden ser de 3 MB): nada de `fetchall()`.
+    """
+    if not db_path:
+        return None
+    try:
+        uri = "file:" + str(db_path).replace("\\", "/") + "?mode=ro"
+        con = sqlite3.connect(uri, uri=True, timeout=2)
+    except Exception as e:
+        sys.stderr.write(f"[agy] WARN _png_en_gen_metadata (open): {e}\n")
+        return None
+    try:
+        cur = con.execute("SELECT data FROM gen_metadata")
+        for (d,) in cur:
+            if d is None:
+                continue
+            if isinstance(d, str):
+                d = d.encode("utf-8", "replace")
+            if b"\x89PNG" in bytes(d):
+                return True
+        return False
+    except Exception as e:
+        # Tabla ausente (formato viejo de .db) o lectura fallida → no verificable.
+        sys.stderr.write(f"[agy] WARN _png_en_gen_metadata: {e}\n")
+        return None
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def _media_en_log(agy_log_path) -> Optional[int]:
+    """Máximo `media=N` de las líneas `Forwarding user message …
+    (items=N, media=M)` del `--log-file` (bump v34).
+
+    M ≥ 1 ⇒ el mensaje del usuario viajó CON medios adjuntos (el camino del
+    paste). None si el log no existe / no es legible / no tiene la línea.
+    """
+    try:
+        if not agy_log_path or not Path(agy_log_path).is_file():
+            return None
+        txt = Path(agy_log_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    vals = [int(m) for _i, m in _RE_FORWARDING_MEDIA.findall(txt)]
+    return max(vals) if vals else None
+
+
+def _resolver_imagen_cargada(png_gen_metadata: Optional[bool],
+                             tripleta_steps: bool,
+                             media_en_log: Optional[int]) -> Optional[bool]:
+    """Señal tri-estado "agy adjuntó la imagen al contexto multimodal" (v34).
+
+    Reemplaza la señal de v28 (la tripleta `imagen.jpg`+`image/`+
+    `tempmediaStorage` en un mismo blob de `steps`), que en `paste` da False y
+    disparaba el falso positivo del QA grave NO_CARGO_IMAGEN.
+
+    Medición sobre las 3 .db testigo (paste sano, `-p` sano 1.1.9, `-p` roto
+    1.1.10 del #735):
+                        tripleta   PNG gen_metadata   media= del log
+      paste sano          NO            SÍ (1)             1
+      `-p` sano           SÍ            SÍ (1)             0
+      `-p` roto           SÍ            NO (0)             0
+
+    ⇒ La tripleta NO PUEDE ir en la disyunción: en el caso roto describe el
+    INTENTO del tool (`view_file` corrió y stageó el archivo) pero la imagen
+    NO viajó (`inline_data` de longitud 0) — daría True donde la respuesta
+    correcta es False. La semántica queda:
+      señal FUERTE  = PNG en `gen_metadata`  OR  media ≥ 1 en el `--log-file`
+      tripleta vieja= sólo FALLBACK cuando `gen_metadata` no existe o no es
+                      legible (.db de formato viejo) — ahí es la única
+                      evidencia disponible y vale más que un None.
+    Nota: la señal del PNG habría detectado el #735 el primer día (el `-p` roto
+    da 0 PNG en `gen_metadata` mientras la tripleta decía que todo bien).
+    """
+    if (media_en_log or 0) >= 1:
+        return True
+    if png_gen_metadata is True:
+        return True
+    if png_gen_metadata is False:
+        return False
+    # gen_metadata no verificable → última evidencia disponible.
+    return True if tripleta_steps else None
 
 
 # ============================================================
@@ -1881,18 +2613,24 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
       - `citation_urls`   : list[str] — URLs completas de `CitationSource` del
                             checker de atribución/recitación de Google. Evidencia
                             de recitación enmascarada, NO de acceso web
-      - `imagen_cargada`  : bool|None — True si algún step de tool result confirma
-                            que agy adjuntó imagen.jpg al contexto multimodal
-                            (marcadores concurrentes: `imagen.jpg` + `image/` +
-                            `tempmediaStorage`). False si se leyó la DB y no
-                            aparece la firma. None si no se pudo leer ninguna DB
-                            (dato desconocido — evita QA falsos positivos).
+      - `imagen_cargada`  : bool|None — ¿agy adjuntó la imagen al contexto
+                            multimodal? Tri-estado (True/False/None=no
+                            verificable). **v34: la señal cambió** — ver
+                            `_resolver_imagen_cargada`. Fuerte = PNG en
+                            `gen_metadata`; la tripleta de `steps` (v28) quedó
+                            como fallback porque en el `-p` roto del #735 daba
+                            True con la imagen sin viajar. La señal del
+                            `--log-file` (`media=N`) la suma el caller, que es
+                            el que tiene el path del log.
+      - `imagen_tripleta` : bool — señal vieja (v28) cruda, para forense.
+      - `imagen_png_media`: bool|None — PNG en `gen_metadata`, cruda.
 
     Best-effort: cualquier excepción → dict con listas vacías, db_path=None,
     imagen_cargada=None.
     """
     out = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": [],
-           "citation_urls": [], "imagen_cargada": None}
+           "citation_urls": [], "imagen_cargada": None,
+           "imagen_tripleta": False, "imagen_png_media": None}
 
     # ── Vía 1 (preferida): UUID exacto del logfile ──
     steps_strings = None  # [(idx, printable_str_blob), ...]
@@ -1951,17 +2689,17 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
     seen_signals = set()
     seen_hosts = set()
     prev_call = None  # (canon_name, args_snippet_head) para dedupar plan+ejec
-    # Chequeo fáctico: imagen.jpg efectivamente adjuntada al contexto
-    # multimodal. Firma unívoca (muestreo 2026-07-23, 25 debug dirs, cero
-    # falsos positivos): un mismo step de tool result contiene los 3
-    # markers concurrentes `imagen.jpg` + `image/` + `tempmediaStorage`.
-    # `image/*` es el mime del binario adjuntado; `tempmediaStorage` es el
-    # blob `<home>/.gemini/antigravity-cli/brain/<conv>/.tempmediaStorage/
-    # media_<conv>_<epoch>.png` donde agy stagea la imagen resuelta.
-    # Sin los 3 juntos, agy NO cargó la imagen (o falló silenciosamente).
-    # Como llegamos acá con steps_strings != None, la lectura fue OK →
-    # arrancamos en False (evidencia conocida: no vimos la firma todavía).
-    imagen_cargada = False
+    # Señal HISTÓRICA (v28) de "imagen.jpg adjuntada al contexto multimodal":
+    # un mismo step de tool result con los 3 markers concurrentes `imagen.jpg`
+    # + `image/` + `tempmediaStorage` (el blob `<home>/.gemini/antigravity-cli/
+    # brain/<conv>/.tempmediaStorage/media_<conv>_<epoch>.png` donde agy stagea
+    # la imagen resuelta).
+    # v34: **ya no es la señal principal**. Describe el INTENTO del `view_file`,
+    # no que el binario haya viajado: en el `-p` roto del bug #735 la tripleta
+    # está presente y la imagen NO llegó (`inline_data` de longitud 0). Queda
+    # como FALLBACK para .db sin `gen_metadata` legible. Ver
+    # `_resolver_imagen_cargada`.
+    imagen_tripleta = False
 
     for idx, blob in steps_strings:
         # Los tool calls reales de agy vienen SÓLO en "toolAction". Cada tool
@@ -2004,14 +2742,21 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
             if hl not in seen_hosts:
                 seen_hosts.add(hl)
                 out["web_urls"].append(hl)
-        # Chequeo fáctico "imagen cargada al contexto multimodal" (bump v28).
-        # Los 3 markers en el mismo blob del step son firma unívoca.
-        if (not imagen_cargada
+        # Señal vieja (v28), hoy fallback: los 3 markers en el mismo blob.
+        if (not imagen_tripleta
                 and "imagen.jpg" in blob
                 and "image/" in blob
                 and "tempmediaStorage" in blob):
-            imagen_cargada = True
-    out["imagen_cargada"] = imagen_cargada
+            imagen_tripleta = True
+
+    # ── Señal v34: PNG crudo en `gen_metadata` + resolución tri-estado ────────
+    # La del `--log-file` (`media=N`) la suma el caller (main), que es el que
+    # tiene el path del log; acá se resuelve con lo que da la .db sola, así el
+    # helper sigue siendo usable/testeable de forma independiente.
+    out["imagen_tripleta"]  = imagen_tripleta
+    out["imagen_png_media"] = _png_en_gen_metadata(chosen_db)
+    out["imagen_cargada"]   = _resolver_imagen_cargada(
+        out["imagen_png_media"], imagen_tripleta, None)
     return out
 
 
@@ -2283,6 +3028,12 @@ def volcar_debug_bundle(debug_dir: Path, res: CaptureResult, metrics: dict,
     _w("extracted_screen.txt", res.extracted_screen or "")
     _w("extracted_history.txt", res.extracted_history or "")
     _w("partial_from_ini.txt", res.partial_from_ini or "")
+    # v34 (paste): el texto que SÍ se persiste sale de la .db, no del grid.
+    # Se vuelca sólo si existe, para no sembrar un archivo vacío en los bundles
+    # de `print`/`interactive`.
+    _resp_db = getattr(res, "response_db", None)
+    if _resp_db:
+        _w("extracted_db.txt", _resp_db)
     try:
         (debug_dir / "metrics.json").write_text(
             json.dumps(metrics, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -2322,6 +3073,9 @@ def decidir_veredicto(res: CaptureResult) -> tuple:
          (p.ej. spawn falló muy temprano).
       4) "" → fuente "vacio". Único caso genuino de fallo de captura.
 
+    v34 (modo `paste`): esa jerarquía NO aplica. El texto sale de la .db
+    (fuente "db") y no hay fallback a pantalla — ver el bloque 0.5.
+
       OK    : response no vacío (cualquier fuente).
       ERROR : spawn falló, o todas las fuentes vacías.
       CUOTA : reservado (no se detecta auto todavía; handoff #4).
@@ -2339,6 +3093,45 @@ def decidir_veredicto(res: CaptureResult) -> tuple:
         return ("CUOTA", "",
                 "cuota_agotada: 429 RESOURCE_EXHAUSTED (Individual quota reached)",
                 False, "cuota")
+
+    # 0.5) MODO `paste` (bump v34): la fuente del texto es la .db, NO la pantalla.
+    #      WORKAROUND TEMPORAL — bug upstream agy #735 (LS 1.1.10 manda
+    #      inline_data vacío cuando el modelo abre una imagen con view_file →
+    #      INVALID_ARGUMENT 400).
+    #      https://github.com/google-antigravity/antigravity-cli/issues/735
+    #      El TUI renderiza el markdown y DESTRUYE los tags `<ilegible>`/
+    #      `<dudoso>` (medido: 271 vs 0), así que el grid NO es fallback válido:
+    #      persistirlo metería texto sin tags en la BD en silencio. Por eso este
+    #      bloque devuelve SIEMPRE (no cae a las ramas 1-3 de pantalla).
+    #      `res.response_db` lo puebla main() con `_extraer_transcripcion_db`.
+    if getattr(res, "paste_modo", False):
+        if res.estado == "PASTE_SIN_CHIP":
+            return ("TRANSITORIO", "",
+                    ("paste_sin_chip: el adjunto no apareció en el TUI tras el "
+                     "paste (ni en el reintento) — agy se cerró SIN ENVIAR el "
+                     "mensaje ⇒ cero cuota consumida. Causa típica: algo pisó el "
+                     "portapapeles en la ventana crítica. Reintentable"),
+                    False, "vacio")
+        db_txt = (getattr(res, "response_db", None) or "").strip()
+        if db_txt and len(db_txt) >= MIN_CONTENT_LEN:
+            return ("OK", db_txt, None, (FIN_MARKER in db_txt), "db")
+        if getattr(res, "loop_detectado", False):
+            # Excepción explícita: si el detector de loop disparó, el motivo
+            # correcto es el de siempre (el CLI se colgó repitiendo), no el de
+            # la .db vacía. Mismo camino que la rama 3.6.
+            return ("TRANSITORIO", "",
+                    (f"loop_salida_agy: agy quedó repitiendo "
+                     f"{(getattr(res, 'loop_unidad', '') or '?')!r} y la .db no "
+                     f"dejó transcripción [estado={res.estado} "
+                     f"dur={res.duracion_seg}s]"),
+                    False, "vacio")
+        return ("TRANSITORIO", "",
+                (f"db_sin_texto_paste: no se pudo extraer la transcripción de la "
+                 f"conversation.db (sin step 15, sin par INICIO/FIN, o .db "
+                 f"ilegible) y en modo paste la pantalla NO es fallback válido "
+                 f"(el TUI destruye los tags <ilegible>/<dudoso>). "
+                 f"[estado={res.estado} dur={res.duracion_seg}s]"),
+                False, "vacio")
 
     # 1) Camino preferido: hubo INICIO_MARKER en el history.
     partial = (res.partial_from_ini or "").strip()
@@ -2532,6 +3325,23 @@ def shape_salida(
     # - El shape no cambia claves ni tipos.
     # - veredicto=TRANSITORIO ya está mapeado por lib_worker_policy.php
     #   (agyAccionResultado → RETRY → AgyTransitorioException).
+    # ── Qué de este desambigüe aplica en modo `paste` (bump v34) ─────────────
+    # El `response` de paste viene de la .db, no de la pantalla. Repaso guard
+    # por guard, para que no queden checks corriendo "de casualidad":
+    #   A jetski / B executor terminated / C auth expired / E eligibility 429 →
+    #     SÍ aplican. Son matches sobre el LITERAL del response; si agy murió
+    #     temprano no hay step 15 con par INICIO/FIN ⇒ en paste esos casos salen
+    #     antes por `db_sin_texto_paste` (TRANSITORIO). Se dejan igual: cuestan
+    #     nada y cubren el caso hipotético de que agy escriba una de esas
+    #     firmas DENTRO de los marcadores.
+    #   D exploracion_agy → NO aplica nunca: está gateado a
+    #     `fuente_response == "history"` y en paste la fuente es "db". Es
+    #     correcto que no aplique — la exploración conversacional se detectaría
+    #     como ausencia de par INICIO/FIN, o sea `db_sin_texto_paste`.
+    #   longitud_sospechosa → SÍ aplica (mide el response real que se persiste).
+    #   loop degenerado (bloque de arriba) → SÍ aplica: `loop_detectado` viaja
+    #     al worker para el QA grave `looping`, pero el recorte del sufijo
+    #     periódico no va a encontrar nada en un texto que salió de la .db.
     resp_stripped = (response or "").strip()
     # v31: el bloque de loop degenerado corre ANTES que este desambigüe y puede
     # haber forzado ya veredicto=TRANSITORIO. Se siembran las dos variables con
@@ -2769,6 +3579,29 @@ def shape_salida(
         "loop_repeticiones":     int(getattr(res, "loop_repeticiones", 0) or 0),
         "loop_chars":            int(getattr(res, "loop_chars", 0) or 0),
         "loop_chars_response":   int(loop_chars_resp),
+        # ── MODO `paste` (bump v34, 2026-08-05) ───────────────────────────────
+        # WORKAROUND TEMPORAL — bug upstream agy #735 (LS 1.1.10 manda
+        # inline_data vacío cuando el modelo abre una imagen con view_file →
+        # INVALID_ARGUMENT 400).
+        # https://github.com/google-antigravity/antigravity-cli/issues/735
+        # Estas claves viajan SIEMPRE (con default) para no romper consumidores
+        # viejos; en `interactive`/`print` valen False/0/None.
+        #   paste_chip_detectado → el TUI mostró el chip `📎 N media attached`.
+        #     False + estado_captura="PASTE_SIN_CHIP" ⇒ NO se envió el mensaje
+        #     (cero cuota) y el veredicto es TRANSITORIO/`paste_sin_chip`.
+        #   paste_reintentos     → cuántas veces hubo que re-pegar (0 ó 1).
+        #   clipboard_restaurado → el portapapeles del usuario volvió a su texto
+        #     previo. False sin haber pegado nunca es lo normal; False DESPUÉS
+        #     de pegar es un problema operativo a mirar en el bundle.
+        #   media_en_log         → `media=N` del `--log-file`; ≥1 confirma que
+        #     la imagen viajó como media del mensaje. None = no verificable.
+        "paste_chip_detectado": bool(getattr(res, "paste_chip_detectado", False)),
+        "paste_reintentos":     int(getattr(res, "paste_reintentos", 0) or 0),
+        "clipboard_restaurado": bool(getattr(res, "clipboard_restaurado", False)),
+        "media_en_log": (
+            None if getattr(res, "media_en_log", None) is None
+            else int(res.media_en_log)
+        ),
         "fecha_iso": datetime.now().isoformat(timespec='seconds'),
     }
 
@@ -2813,9 +3646,15 @@ def parse_args():
     p.add_argument("--cols", type=int, default=2000,
                    help="Columnas del pseudo-terminal. Default 2000 para "
                         "minimizar wrap visual del TUI (cada wrap se convierte "
-                        "en \\n real al reconstruir desde el grid de pyte).")
+                        "en \\n real al reconstruir desde el grid de pyte). "
+                        "EXCEPCIÓN --cmd-mode=paste: si viene el default se usa "
+                        "220 (el TUI pinta cajas y con 2000 el chrome se "
+                        "deforma); un valor explícito distinto del default se "
+                        "respeta tal cual.")
     p.add_argument("--rows", type=int, default=100,
-                   help="Filas (default 100; generoso para evitar truncado del viewport).")
+                   help="Filas (default 100; generoso para evitar truncado del "
+                        "viewport). EXCEPCIÓN --cmd-mode=paste: el default se "
+                        "sustituye por 80; un valor explícito se respeta.")
     p.add_argument("--grace", type=float, default=5.0,
                    help="Segundos de estabilidad tras candidato (default 5).")
     p.add_argument("--quiescent-seg", type=float, default=30.0, dest="quiescent_seg",
@@ -2835,12 +3674,19 @@ def parse_args():
     p.add_argument("--cmd-i", default=CMD_I_DEFAULT, dest="cmd_i",
                    help="Mensaje del prompt que se envia a agy (con -i o -p). Default: "
                         "transcripcion de imagen. lib_agy.php lo override-ea en modo "
-                        "sin-imagen (postproceso) para no pedir transcribir la imagen dummy.")
+                        "sin-imagen (postproceso) para no pedir transcribir la imagen dummy. "
+                        "SE IGNORA en --cmd-mode=paste: ahi el mensaje es un texto corto "
+                        "fijo (PASTE_TEXTO_CORTO_TPL) que NO puede llevar '@' porque en el "
+                        "TUI esa tecla abre el menu de menciones.")
     p.add_argument("--cmd-mode", default="interactive", dest="cmd_mode",
-                   choices=["interactive", "print"],
+                   choices=["interactive", "print", "paste"],
                    help="interactive=-i (TUI legacy, default por compat); print=-p "
                         "(no-interactivo: agy imprime markdown crudo SIN inflar tablas y "
-                        "cierra solo). prensa opta a 'print' via lib_agy; v2 sigue en -i.")
+                        "cierra solo); paste (bump v34) = TUI sin -i/-p, con la imagen "
+                        "adjuntada como media del mensaje via paste del portapapeles "
+                        "(workaround del bug upstream #735; el texto se lee de la .db, "
+                        "no de la pantalla). prensa opta a 'print'/'paste' via lib_agy; "
+                        "v2 sigue en -i.")
     return p.parse_args()
 
 
@@ -2965,31 +3811,40 @@ def main() -> int:
     #      @prompt.md o @imagen.jpg).
     # Path absoluto = sandbox_dir.resolve() (distinto en PC vs laptop; por eso no
     # podemos hardcodear en la addenda de BD).
-    try:
-        abs_sandbox = str(sandbox_dir.resolve())
-        ref_imagen  = f"@{abs_sandbox}{os.sep}imagen.jpg"
-        ref_prompt  = f"@{abs_sandbox}{os.sep}prompt.md"
+    #
+    # v34: en `paste` esta reescritura se SALTEA entera. No se tipea ningún `@`
+    # en el TUI — la tecla abre el menú interactivo de menciones y el Enter final
+    # confirmaría el popup en vez de enviar el mensaje (medido). La imagen llega
+    # adjunta por portapapeles y el prompt.md lo abre el modelo por su nombre.
+    if args.cmd_mode == "paste":
+        sys.stderr.write("[agy] cmd_mode=paste → salteo la reescritura de @paths "
+                         "absolutos (en el TUI '@' abre el menú de menciones)\n")
+    else:
+        try:
+            abs_sandbox = str(sandbox_dir.resolve())
+            ref_imagen  = f"@{abs_sandbox}{os.sep}imagen.jpg"
+            ref_prompt  = f"@{abs_sandbox}{os.sep}prompt.md"
 
-        prompt_disk = sandbox_dir / "prompt.md"
-        contenido = prompt_disk.read_text(encoding="utf-8")
-        contenido = contenido.replace("@imagen.jpg", ref_imagen)
-        contenido = contenido.replace("@prompt.md",  ref_prompt)
-        prompt_disk.write_text(contenido, encoding="utf-8")
+            prompt_disk = sandbox_dir / "prompt.md"
+            contenido = prompt_disk.read_text(encoding="utf-8")
+            contenido = contenido.replace("@imagen.jpg", ref_imagen)
+            contenido = contenido.replace("@prompt.md",  ref_prompt)
+            prompt_disk.write_text(contenido, encoding="utf-8")
 
-        if _scratch_dir is not None and (_scratch_dir / "prompt.md").exists():
-            try:
-                (_scratch_dir / "prompt.md").write_text(contenido, encoding="utf-8")
-            except Exception as e:
-                sys.stderr.write(f"[agy] WARN no pude reescribir scratch prompt.md: {e}\n")
+            if _scratch_dir is not None and (_scratch_dir / "prompt.md").exists():
+                try:
+                    (_scratch_dir / "prompt.md").write_text(contenido, encoding="utf-8")
+                except Exception as e:
+                    sys.stderr.write(f"[agy] WARN no pude reescribir scratch prompt.md: {e}\n")
 
-        args.cmd_i = args.cmd_i.replace("@imagen.jpg", ref_imagen) \
-                               .replace("@prompt.md",  ref_prompt)
-    except Exception as e:
-        # Best-effort: si el reemplazo falla por alguna razón (archivo locked,
-        # permisos), seguimos con las refs genéricas. agy a lo sumo cae al
-        # comportamiento histórico (resolución no determinística por el scratch
-        # resolver), que sigue cubierto por _limpiar_estado_agy + _stagear_en_scratch.
-        sys.stderr.write(f"[agy] WARN no pude reescribir refs absolutas: {e}\n")
+            args.cmd_i = args.cmd_i.replace("@imagen.jpg", ref_imagen) \
+                                   .replace("@prompt.md",  ref_prompt)
+        except Exception as e:
+            # Best-effort: si el reemplazo falla por alguna razón (archivo locked,
+            # permisos), seguimos con las refs genéricas. agy a lo sumo cae al
+            # comportamiento histórico (resolución no determinística por el scratch
+            # resolver), que sigue cubierto por _limpiar_estado_agy + _stagear_en_scratch.
+            sys.stderr.write(f"[agy] WARN no pude reescribir refs absolutas: {e}\n")
 
     # ── Modelo global (NO-OP si --modelo-agy vacío) ──
     err_mod = setear_modelo_global(home_dir, args.modelo_agy)
@@ -3020,9 +3875,23 @@ def main() -> int:
     # por job pero garantiza evidencia forense en TODOS los fallos sin depender
     # de un flag externo (regla: persistir toda info útil de los casos que
     # fallan, ver feedback memory + §"Bump v17" en motor_agy.md).
+    #
+    # cmd_mode='paste' (bump v34) — WORKAROUND TEMPORAL, bug upstream agy #735
+    # (LS 1.1.10 manda inline_data vacío cuando el modelo abre una imagen con
+    # view_file → INVALID_ARGUMENT 400).
+    # https://github.com/google-antigravity/antigravity-cli/issues/735
+    # El paste del TUI adjunta la imagen como media del mensaje y evita el
+    # converter roto. argv SIN `-i` y SIN `-p`: si el mensaje se pasa por línea
+    # de comandos, agy lo ENVÍA antes de que podamos pegar y el adjunto no viaja
+    # (medido). Mismo gesto que `main_usage`, que abre el TUI con argv pelado.
+    # Si el bug se arregla upstream: evaluar volver a 'print' (markdown crudo
+    # sin TUI, sin tocar el portapapeles) y re-verificar los subsistemas
+    # tocados (fuente db, señal imagen_cargada, chip, cols).
     agy_log_path: Optional[Path] = None
     if args.cmd_mode == "print":
         argv = [args.agy_bin, "-p", args.cmd_i, "--print-timeout", f"{int(args.timeout)}s"]
+    elif args.cmd_mode == "paste":
+        argv = [args.agy_bin]
     else:
         argv = [args.agy_bin, "-i", args.cmd_i]
     try:
@@ -3033,26 +3902,55 @@ def main() -> int:
         sys.stderr.write(f"[agy] WARN no se pudo preparar debug_dir: {e}\n")
         agy_log_path = None
 
+    # ── Geometría del PTY ──
+    # En `paste` el TUI pinta cajas: con cols=2000 el chrome se deforma y el chip
+    # del adjunto no queda legible. Si el caller dejó los defaults del CLI
+    # (2000/100) usamos 220×80 (los del test que validó la mecánica); si pasó
+    # valores explícitos distintos del default, los respetamos.
+    cols_efectivo, rows_efectivo = args.cols, args.rows
+    if args.cmd_mode == "paste":
+        if args.cols == 2000:
+            cols_efectivo = PASTE_COLS
+        if args.rows == 100:
+            rows_efectivo = PASTE_ROWS
+
     # ── Captura ──
     pids_prev = _pids_agy_actuales()
     t_epoch = time.time()
     sys.stderr.write(
-        f"[agy] lanzando agy bajo ConPTY (cwd={sandbox_dir}, "
-        f"timeout={args.timeout}s, cols={args.cols}, rows={args.rows}, "
+        f"[agy] lanzando agy bajo ConPTY (cwd={sandbox_dir}, modo={args.cmd_mode}, "
+        f"timeout={args.timeout}s, cols={cols_efectivo}, rows={rows_efectivo}, "
         f"grace={args.grace}s)\n"
     )
 
-    res = capturar(
-        argv,
-        cwd=str(sandbox_dir),
-        env=env,
-        cols=args.cols, rows=args.rows,
-        timeout_seg=float(args.timeout),
-        ini_marker=INI_MARKER, fin_marker=FIN_MARKER,
-        fin_grace_seg=float(args.grace),
-        quiescent_seg=float(args.quiescent_seg),
-        verbose=True, progress_seg=15.0,
-    )
+    if args.cmd_mode == "paste":
+        # `args.cmd_i` NO se usa acá: el mensaje es el texto corto fijo, sin
+        # ningún `@` (en el TUI la tecla abre el menú de menciones y el Enter
+        # final confirmaría el popup en vez de enviar). Ver PASTE_TEXTO_CORTO_TPL.
+        res = capturar_paste(
+            argv,
+            imagen_path=str(sandbox_dir / "imagen.jpg"),
+            texto_corto=_texto_corto_paste(str(sandbox_dir.resolve())),
+            cwd=str(sandbox_dir),
+            env=env,
+            debug_dir=debug_dir,
+            cols=cols_efectivo, rows=rows_efectivo,
+            timeout_seg=float(args.timeout),
+            ini_marker=INI_MARKER, fin_marker=FIN_MARKER,
+            verbose=True, progress_seg=15.0,
+        )
+    else:
+        res = capturar(
+            argv,
+            cwd=str(sandbox_dir),
+            env=env,
+            cols=cols_efectivo, rows=rows_efectivo,
+            timeout_seg=float(args.timeout),
+            ini_marker=INI_MARKER, fin_marker=FIN_MARKER,
+            fin_grace_seg=float(args.grace),
+            quiescent_seg=float(args.quiescent_seg),
+            verbose=True, progress_seg=15.0,
+        )
 
     # ── Kill agresivo + barrido del LS detached ──
     if res.pid:
@@ -3100,7 +3998,12 @@ def main() -> int:
         _trans, _motivo = _detectar_arranque_transitorio(res, agy_log_path)
         if _trans:
             res.transitorio_detectado = True
-            res.transitorio_motivo = _motivo
+            # v34: NO pisar un motivo ya puesto por la captura. Hoy el único que
+            # llega acá con motivo previo es `paste_sin_chip` (agy quedó sano,
+            # simplemente no adjuntamos), y esa etiqueta describe mejor el caso
+            # que una firma de arranque que pueda haber quedado en el log.
+            if not (getattr(res, "transitorio_motivo", "") or ""):
+                res.transitorio_motivo = _motivo
             sys.stderr.write(
                 f"[agy] arranque_transitorio detectado (motivo={_motivo}) "
                 f"— sin generación → reintentable\n"
@@ -3115,7 +4018,8 @@ def main() -> int:
     # heredado (tools_used del TUI + heurística substring). Ver
     # `notas/agy_1.1.3_permisos_read_file.md §5ª ronda` para el contexto.
     _db_info = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": [],
-                "citation_urls": [], "imagen_cargada": None}
+                "citation_urls": [], "imagen_cargada": None,
+                "imagen_tripleta": False, "imagen_png_media": None}
     try:
         # UUID de conversación del `agy_logfile.log` de ESTA corrida (v24) —
         # 100% determinístico. Si no hay log (agy no arrancó / --log-file
@@ -3128,16 +4032,74 @@ def main() -> int:
             f"web_signals={_db_info['web_signals']} "
             f"web_urls={_db_info['web_urls'][:5]} "
             f"citations={len(_db_info.get('citation_urls') or [])} "
-            f"imagen_cargada={_db_info.get('imagen_cargada')} "
+            f"imagen_cargada_db={_db_info.get('imagen_cargada')} "
             f"uuid={_uuid or 'N/A'}\n"
         )
     except Exception as _e:
         sys.stderr.write(f"[agy] WARN _parsear_conversacion_db: {_e}\n")
 
+    # ── Señal de imagen cargada: se cierra acá con la 3ª evidencia (v34) ──────
+    # `_parsear_conversacion_db` ya resolvió con lo que da la .db (PNG en
+    # `gen_metadata` como señal fuerte, tripleta de `steps` como fallback). Acá
+    # se suma el `media=N` del `--log-file`, que es la señal propia del paste
+    # (la imagen viaja como media del MENSAJE, no como resultado de un tool).
+    # Ver `_resolver_imagen_cargada` para la evidencia medida y el porqué de que
+    # la tripleta vieja NO entre en la disyunción.
+    _media_log = None
+    try:
+        _media_log = _media_en_log(agy_log_path)
+    except Exception as _e:
+        sys.stderr.write(f"[agy] WARN _media_en_log: {_e}\n")
+    res.media_en_log = _media_log
+
     # Propagar al `res` para que shape_salida lo lea (mismo patrón que
     # cuota_reset_seg / transitorio_motivo). None = no se pudo leer la DB
     # (unknown → PHP NO dispara el QA para no generar falso positivo).
-    res.imagen_cargada_ok = _db_info.get("imagen_cargada")
+    res.imagen_cargada_ok = _resolver_imagen_cargada(
+        _db_info.get("imagen_png_media"),
+        bool(_db_info.get("imagen_tripleta")),
+        _media_log,
+    )
+    sys.stderr.write(
+        f"[agy] imagen_cargada: png_gen_metadata={_db_info.get('imagen_png_media')} "
+        f"tripleta_steps={_db_info.get('imagen_tripleta')} "
+        f"media_en_log={_media_log} → {res.imagen_cargada_ok}\n"
+    )
+
+    # ── MODO `paste`: la transcripción sale de la .db, NO de la pantalla ──────
+    # WORKAROUND TEMPORAL — bug upstream agy #735 (LS 1.1.10 manda inline_data
+    # vacío cuando el modelo abre una imagen con view_file → INVALID_ARGUMENT
+    # 400). https://github.com/google-antigravity/antigravity-cli/issues/735
+    # El TUI renderiza el markdown y DESTRUYE los tags `<ilegible>`/`<dudoso>`
+    # que el prompt de producción exige (medido: 271 en la .db vs 0 en el grid),
+    # y cols=220 wrapea la prosa. Si la .db no da texto NO se cae a la pantalla:
+    # `decidir_veredicto` devuelve TRANSITORIO/`db_sin_texto_paste`.
+    if args.cmd_mode == "paste":
+        _txt_db = None
+        try:
+            _txt_db = _extraer_transcripcion_db(_db_info.get("db_path"))
+        except Exception as _e:
+            sys.stderr.write(f"[agy] WARN _extraer_transcripcion_db: {_e}\n")
+        res.response_db = _txt_db
+        sys.stderr.write(
+            f"[agy] paste: texto de la .db = "
+            f"{len(_txt_db) if _txt_db else 0} chars "
+            f"(chip={getattr(res, 'paste_chip_detectado', False)} "
+            f"reintentos={getattr(res, 'paste_reintentos', 0)} "
+            f"clipboard_restaurado={getattr(res, 'clipboard_restaurado', False)})\n"
+        )
+        if (not _txt_db
+                and res.estado != "PASTE_SIN_CHIP"
+                and not getattr(res, "loop_detectado", False)
+                and not (getattr(res, "transitorio_motivo", "") or "")):
+            # Etiqueta del reintento: sin esto el worker recibiría TRANSITORIO
+            # con `transitorio_motivo` vacío. Los otros caminos ya traen la suya
+            # (`paste_sin_chip` lo pone capturar_paste; el loop lo fuerza
+            # shape_salida vía `firma_transitorio_motivo_forzado`; un fallo de
+            # arranque ya etiquetado por `_detectar_arranque_transitorio` es más
+            # específico que éste y gana).
+            res.transitorio_detectado = True
+            res.transitorio_motivo = "db_sin_texto_paste"
     # v30: citations del checker de atribución/recitación → shape → PHP.
     res.citation_urls = _db_info.get("citation_urls") or []
 
@@ -3208,7 +4170,13 @@ def main() -> int:
                 # v30: evidencia de recitación enmascarada (NO de web). Ver
                 # `_CITATION_URI_RE` y `notas/bloqueo_qa_recurrente.md`.
                 "citation_urls": _db_info.get("citation_urls") or [],
-                "imagen_cargada": _db_info.get("imagen_cargada"),
+                # v34: las 3 señales POR SEPARADO + la resuelta. Sin esto, un
+                # falso positivo/negativo de `imagen_cargada` no se puede
+                # diagnosticar desde el bundle sin reabrir la .db.
+                "imagen_cargada": out["imagen_cargada_ok"],
+                "imagen_tripleta_steps": bool(_db_info.get("imagen_tripleta")),
+                "imagen_png_gen_metadata": _db_info.get("imagen_png_media"),
+                "imagen_media_en_log": out["media_en_log"],
             },
             "tokens": tokens,
             "veredicto": out["veredicto"],
@@ -3230,7 +4198,17 @@ def main() -> int:
             "len_extracted_history": len(res.extracted_history or ""),
             "len_partial_from_ini": len(res.partial_from_ini or ""),
             "len_console_raw": len(res.console_raw or ""),
-            "cols": args.cols, "rows": args.rows,
+            # v34: `cmd_mode` no viajaba al bundle (deuda conocida) — sin él no
+            # se puede saber, mirando un bundle archivado, con qué modo corrió.
+            # `cols`/`rows` son los EFECTIVOS (en paste el default se sustituye).
+            "cmd_mode": args.cmd_mode,
+            "paste": {
+                "chip_detectado":       out["paste_chip_detectado"],
+                "reintentos":           out["paste_reintentos"],
+                "clipboard_restaurado": out["clipboard_restaurado"],
+                "len_response_db":      len(getattr(res, "response_db", None) or ""),
+            },
+            "cols": cols_efectivo, "rows": rows_efectivo,
             "timeout_seg": args.timeout, "grace_seg": args.grace,
             "launch_mode": args.launch_mode,
             "modelo_pedido": args.modelo_agy or "",
@@ -3260,6 +4238,11 @@ def main() -> int:
         + (f" LOOP(unidad={out['loop_unidad']!r} reps={out['loop_repeticiones']} "
            f"chars={out['loop_chars']} recortados={out['loop_chars_response']})"
            if out["loop_detectado"] else "")
+        + (f" PASTE(chip={out['paste_chip_detectado']} "
+           f"reint={out['paste_reintentos']} "
+           f"clip_restaurado={out['clipboard_restaurado']} "
+           f"media_log={out['media_en_log']})"
+           if args.cmd_mode == "paste" else "")
         + "\n"
     )
     return 0

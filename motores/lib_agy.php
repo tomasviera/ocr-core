@@ -254,9 +254,18 @@ function _agyEjecutarUnIntento(
         $cmd[] = '--cmd-i';
         $cmd[] = $cmdI;
     }
-    // Modo de invocación de agy: 'interactive' (-i, legacy) o 'print' (-p, sin
-    // inflar tablas). El .py default-ea a interactive si no se pasa → degradación
-    // segura si un vendor viejo no manda este flag.
+    // Modo de invocación de agy: 'interactive' (-i, legacy), 'print' (-p, sin
+    // inflar tablas) o 'paste' (bump v34). El .py default-ea a interactive si no
+    // se pasa → degradación segura si un vendor viejo no manda este flag.
+    //
+    // WORKAROUND TEMPORAL — bug upstream agy #735 (LS 1.1.10 manda `inline_data`
+    // de longitud 0 cuando el modelo abre una imagen con `view_file` →
+    // INVALID_ARGUMENT 400). https://github.com/google-antigravity/antigravity-cli/issues/735
+    // 'paste' abre el TUI SIN -i/-p y adjunta la imagen como media del mensaje
+    // vía portapapeles, evitando el converter roto. El valor viaja OPACO: acá no
+    // hay validación de valores (la hace el `choices` del argparse del .py), así
+    // que sumar el modo no requirió tocar el armado del comando.
+    // Si el bug se arregla upstream: evaluar volver a 'print'.
     if ($cmdMode !== null && $cmdMode !== '') {
         $cmd[] = '--cmd-mode';
         $cmd[] = $cmdMode;
@@ -375,7 +384,11 @@ function _agyEjecutarUnIntento(
  *                                                              opcionales del .py)
  *                                     'cmd_mode'              ('print' = -p sin inflar
  *                                                              tablas; 'interactive' = -i
- *                                                              legacy. Default .py: interactive)
+ *                                                              legacy; 'paste' = TUI con la
+ *                                                              imagen adjuntada por
+ *                                                              portapapeles, workaround del
+ *                                                              bug upstream agy #735 — bump
+ *                                                              v34. Default .py: interactive)
  *
  * NOTA v18+: el workdir efímero NO se borra ni se mueve adentro de esta
  * función. Queda en su path local y se devuelve en `sandbox_path` del shape.
@@ -881,8 +894,11 @@ function _agyShapeError(string $errorMsg, float $t0Total): array
  *   websearch_patrones, websearch_fuente, tools_used, longitud_sospechosa,
  *   stdout_largo_sospechoso, estado_captura, bytes_leidos, zombis_barridos,
  *   modelo_pedido, statusline_disponible, context_window_size,
- *   used_percentage, plan_tier, imagen_cargada_ok (bool|null, bump v28),
- *   citation_urls (string[], bump v30 — atribución/recitación, NO web).
+ *   used_percentage, plan_tier, imagen_cargada_ok (bool|null, bump v28; la
+ *   SEÑAL que lo puebla cambió en v34 — ver `_resolver_imagen_cargada` del .py),
+ *   citation_urls (string[], bump v30 — atribución/recitación, NO web),
+ *   paste_chip_detectado / paste_reintentos / clipboard_restaurado /
+ *   media_en_log (bump v34, modo `paste`).
  *
  * `fuente_response` (agregado 2026-06-21) indica de dónde salió `response`
  * para que el worker decida QA bits post-hoc:
@@ -891,6 +907,11 @@ function _agyShapeError(string $errorMsg, float $t0Total): array
  *   - "history"  : sin INICIO/FIN; cayó al history limpio de pyte (v2 con
  *                  prompt `[tipo:]`, o prensa con instruction-following raro).
  *   - "screen"   : fallback al viewport visible (caso muy raro).
+ *   - "db"       : bump v34, sólo `cmd_mode='paste'`. El texto sale del último
+ *                  step de la conversation.db, con los tags `<ilegible>`/
+ *                  `<dudoso>` intactos (el TUI los destruye al renderizar). En
+ *                  paste NO hay fallback a pantalla: sin texto en la .db el
+ *                  veredicto es TRANSITORIO (`db_sin_texto_paste`).
  *   - "vacio"    : ningún dato útil; `ok=false`.
  */
 function _agyShapeRespuesta(
@@ -993,6 +1014,29 @@ function _agyShapeRespuesta(
     $extras['loop_repeticiones']   = isset($data['loop_repeticiones']) ? (int) $data['loop_repeticiones'] : 0;
     $extras['loop_chars']          = isset($data['loop_chars']) ? (int) $data['loop_chars'] : 0;
     $extras['loop_chars_response'] = isset($data['loop_chars_response']) ? (int) $data['loop_chars_response'] : 0;
+    // MODO `paste` (bump v34, 2026-08-05).
+    // WORKAROUND TEMPORAL — bug upstream agy #735 (LS 1.1.10 manda `inline_data`
+    // de longitud 0 cuando el modelo abre una imagen con `view_file` →
+    // INVALID_ARGUMENT 400). https://github.com/google-antigravity/antigravity-cli/issues/735
+    // El paste del TUI adjunta la imagen como media del mensaje y evita el
+    // converter roto. Semántica de las claves (siempre presentes con default,
+    // igual que el bloque de loop → core viejo (v≤33) las omite y quedan
+    // false/0/null, no-op para el worker):
+    //   paste_chip_detectado → el TUI mostró el chip `📎 N media attached`. Si
+    //     es false Y `estado_captura === 'PASTE_SIN_CHIP'`, el mensaje NUNCA se
+    //     envió (cero cuota) y el veredicto es TRANSITORIO con
+    //     `transitorio_motivo='paste_sin_chip'` → re-encolable.
+    //   paste_reintentos     → veces que hubo que re-pegar (0 ó 1).
+    //   clipboard_restaurado → el portapapeles del usuario volvió a su texto
+    //     previo (el .py lo pisa por la ventana mínima; es un recurso global).
+    //   media_en_log         → `media=N` del `--log-file` de agy. `>= 1` confirma
+    //     que la imagen viajó como media del mensaje; null = no verificable. Es
+    //     una de las 3 señales que componen `imagen_cargada_ok` desde v34.
+    // Ver notas/motor_agy.md §"Bump v34".
+    $extras['paste_chip_detectado'] = !empty($data['paste_chip_detectado']);
+    $extras['paste_reintentos']     = isset($data['paste_reintentos']) ? (int) $data['paste_reintentos'] : 0;
+    $extras['clipboard_restaurado'] = !empty($data['clipboard_restaurado']);
+    $extras['media_en_log']         = isset($data['media_en_log']) ? (int) $data['media_en_log'] : null;
 
     // Token usage del statusLine side-channel (leído por el .py tras cerrar agy).
     // Si el setup manual del statusLine no se hizo, todos quedan en 0. A
