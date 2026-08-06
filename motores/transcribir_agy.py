@@ -598,6 +598,34 @@ class CaptureResult:
     loop_unidad: str = ""
     loop_repeticiones: int = 0
     loop_chars: int = 0
+    # ── v37 ──────────────────────────────────────────────────────────────────
+    # `spawn_ok`: el proceso arrancó. Es un HECHO observado, no el valor inicial
+    # de `estado`. `estado` nace en "ERROR_SPAWN" y sólo se reasigna dentro del
+    # try de las fases, así que hasta v36 una excepción en CUALQUIER fase
+    # posterior (incluso después de que el modelo generó y escribió en la .db)
+    # salía rotulada "falló el spawn" → ERROR terminal, fail-fast, sin mirar si
+    # había texto. Con esto, `estado == "ERROR_SPAWN" and spawn_ok` significa
+    # "excepción de fase", que es infraestructura y se trata distinto.
+    spawn_ok: bool = False
+    # Texto candidato leído de la .db de conversación. Hasta v36 lo poblaba
+    # main() sólo en modo `paste`; desde v37 se intenta en los 3 modos como
+    # RESCATE cuando la pantalla no dio nada.
+    response_db: Optional[str] = None
+    db_fuente: str = ""          # "db" (INICIO+FIN) | "db_parcial" (INICIO sin FIN) | ""
+    db_rechazo: str = ""         # por qué NO se aceptó el candidato; "" si pasó
+    db_candidato: Optional[str] = None   # mejor segmento hallado, PASE O NO las guardas
+    db_marcas_pagina: int = 0    # marcas de estructura en líneas no-razonamiento
+    db_razonamiento: bool = False  # el segmento trae thinking mezclado (etiqueta QA)
+    # ¿La .db elegida es la de ESTA corrida? Tri-estado (True/False/None=no
+    # verificable). Gatea el rescate de texto Y las señales derivadas (v37).
+    db_identidad_ok: Optional[bool] = None
+    # Forense del `--log-file`, leído una sola vez por main() (v33).
+    hubo_generacion: Optional[bool] = None
+    subcausa_log: str = ""
+    # Camino de RESCATE por el que entró el texto (v37): viaja al shape como
+    # `rescate_motivo` y prensa lo convierte en el QA grave `texto_rescatado`.
+    # "" = camino normal.
+    rescate_motivo: str = ""
 
 
 def capturar(
@@ -646,6 +674,7 @@ def capturar(
         return res
 
     res.pid = getattr(proc, "pid", None)
+    res.spawn_ok = True   # v37: el spawn anduvo (ver el campo en CaptureResult)
 
     # Lector en thread daemon (pywinpty.read() BLOQUEA sin datos → si va en el
     # loop principal, un agy esperando input cuelga el timeout).
@@ -990,6 +1019,7 @@ def capturar_paste(
         res.error = f"spawn: {type(e).__name__}: {e}"
         return res
     res.pid = getattr(proc, "pid", None)
+    res.spawn_ok = True   # v37: el spawn anduvo (ver el campo en CaptureResult)
     _log(f"spawn OK pid={res.pid} argv={argv}")
 
     q: "queue.Queue" = queue.Queue()
@@ -1291,6 +1321,17 @@ def capturar_paste(
     except Exception as e:
         res.error = f"paste: {type(e).__name__}: {e}"
         res.notas.append(f"excepcion: {type(e).__name__}: {e}")
+        # v37 — Fix 5: el estado NO puede quedarse en el "ERROR_SPAWN" con el
+        # que nació `res`. El spawn ya había andado (llegamos hasta acá), así
+        # que declarar un fallo de arranque es una afirmación falsa que además
+        # dispara fail-fast SIN mirar si el modelo ya había generado y escrito
+        # la transcripción en la .db. Caso testigo: job 70926 (2026-08-06,
+        # edi 5742 p4) — `EOFError: Pty is closed`, ERROR terminal, página sin
+        # transcribir. Sólo se pisa el estado si NINGUNA fase alcanzó a
+        # asignarlo: un TIMEOUT/OK_FIN previo describe mejor la corrida que la
+        # excepción del cierre. Ver notas/motor_agy.md §"Bump v37".
+        if res.estado == "ERROR_SPAWN" and res.spawn_ok:
+            res.estado = "EXCEPCION_FASE"
         sys.stderr.write(f"[agy-paste] EXCEPCIÓN: {e}\n{traceback.format_exc()}")
     finally:
         # El portapapeles es global: restaurar pase lo que pase.
@@ -1375,25 +1416,85 @@ def capturar_paste(
     return res
 
 
-def _extraer_transcripcion_db(db_path: Optional[str]) -> Optional[str]:
-    """Texto transcripto leído de la `.db` de conversación (bump v34).
+# ══════════════════════════════════════════════════════════════════════════════
+# LECTURA DE LA `.db` DE CONVERSACIÓN — identidad, contenido y errores (v37)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# REGLA DEL SUBSISTEMA (medida sobre los 2.638 bundles de `temp/agy_debug/`):
+# **la pantalla es prueba de identidad; la `.db` NO lo es.** agy toca las `.db`
+# de la carpeta al arrancar, así que el fallback por mtime puede elegir la
+# conversación de OTRO job: 11 bundles con `.db` ajena, 2 de ellos con una
+# transcripción completa y perfecta — de otra página. Por contenido son
+# indistinguibles de una transcripción buena. Por eso TODO lo que sale de la
+# `.db` (texto y señales derivadas) pasa primero por `_db_es_de_esta_corrida`.
 
-    WORKAROUND TEMPORAL — bug upstream agy #735: el modo `paste` existe para
-    esquivarlo, y en `paste` la pantalla NO sirve como fuente: el TUI renderiza
-    el markdown y DESTRUYE los tags `<ilegible>`/`<dudoso>` que el prompt de
-    producción exige (medido: 271 `<ilegible>` en la .db, 0 en el grid pyte),
-    además de wrapear la prosa a `cols`. https://github.com/google-antigravity/antigravity-cli/issues/735
+# Marcas de estructura que el prompt de producción EXIGE (`#/C#` por columna,
+# como mínimo) + los tags de incertidumbre. Sirven como evidencia positiva de
+# "esto es la página", no como filtro de calidad.
+_RE_TAGS_PAGINA = re.compile(
+    r"#T#|#/T#|#ST#|#/ST#|#B#|#/B#|#SEC#|#/SEC#|#C#|#/C#|<i>|</i>|<ilegible>|<dudoso>")
+_RE_FILA_TABLA = re.compile(r"^\s*\|.+\|\s*$")
+# Razonamiento del modelo: llega en inglés, con títulos en negrita y primera
+# persona. NO se usa para descartar texto — sólo para NO contar esas líneas como
+# evidencia de página (ver `_marcas_pagina_en_segmento`).
+_RE_TITULO_RAZONAMIENTO = re.compile(r"^\s*\*\*[^\n*]{3,90}\*\*\s*$")
+_RE_LINEA_RAZONAMIENTO = re.compile(
+    r"\b(I'm|I've|I'll|I am|I have|I will|I need|I noticed|I plan|I should|I can|"
+    r"Let's|I also|my focus|the user|next step|now focusing|transcribing the)\b",
+    re.I)
 
-    Mecánica: del ÚLTIMO step con `step_type=15` (el de la respuesta final) se
-    decodifica `step_payload` como UTF-8 y se toma el PRIMER par
-    INICIO…FIN completo. El payload trae el texto DOS veces, idénticas (medido
-    en la corrida real y en dos bundles de `-p`): con el primer par alcanza.
 
-    Devuelve el segmento CON ambos marcadores (igual que `partial_from_ini`, que
-    es lo que PHP recorta en `parseAndInsertEntradas`), o None si no se pudo
-    leer la .db / no hay step 15 / no hay par completo. NUNCA cae a la pantalla:
-    persistir el render sería meter texto sin tags en la BD en silencio.
+def _marcas_pagina_en_segmento(seg: str) -> int:
+    """Cuánta evidencia hay de que el segmento contiene PÁGINA y no sólo
+    razonamiento del modelo.
+
+    Cuenta marcas de estructura del prompt (`#T#`, `#/C#`, `<i>`, `<ilegible>`,
+    …) y filas de tabla markdown, **descartando las líneas que son razonamiento**
+    (el modelo menciona sus propios tags mientras piensa). NO es un filtro
+    anti-thinking: un segmento con thinking mezclado y página adentro puntúa
+    alto y se persiste igual — lo único que este número decide es si hay ALGO de
+    página, porque persistir 0 chars de página deja la edición en `Completado`
+    con razonamiento y nadie vuelve a mirarla (`actualizarEstadoEdicion` cuenta
+    páginas con entradas, no mira QA).
+
+    Medido sobre los 10 bundles testigo del proyecto `agy_texto_descartado`:
+      - transcripciones reales ......... 308–378 marcas
+      - fragmento real + thinking ......   4 marcas (job58451: 867 ch de página)
+      - razonamiento puro ..............   0 marcas (job62023 6.396 ch,
+                                            job70227 436 ch, job68254 56 ch)
     """
+    n = 0
+    for linea in (seg or "").splitlines():
+        s = linea.strip()
+        if not s or s == FIN_MARKER or s == INI_MARKER:
+            continue
+        if _RE_TITULO_RAZONAMIENTO.match(s) or _RE_LINEA_RAZONAMIENTO.search(s):
+            continue
+        n += len(_RE_TAGS_PAGINA.findall(s))
+        if _RE_FILA_TABLA.match(s):
+            n += 1
+    return n
+
+
+def _hay_razonamiento_en_segmento(seg: str) -> bool:
+    """¿El segmento trae razonamiento del modelo mezclado con la página?
+
+    Señal: al menos un título en negrita suelto (`**Examining Column 1 Data**`),
+    la forma en que el modelo encabeza cada bloque de thinking. Es una ETIQUETA
+    para el QA (`thinking_mezclado`), NO un filtro: el texto se persiste igual.
+    Medido en los bundles testigo — transcripciones limpias: 0 títulos
+    (job69869/53672/53681/68768); mezcladas: 1 (job58451, job70227) y 16
+    (job62023).
+    """
+    for linea in (seg or "").splitlines():
+        if _RE_TITULO_RAZONAMIENTO.match(linea.strip()):
+            return True
+    return False
+
+
+def _leer_una_columna_db(db_path: Optional[str], sql: str) -> Optional[list]:
+    """`SELECT` best-effort en modo read-only con reintentos. None si no se pudo
+    leer (agy puede tener la .db lockeada con WAL)."""
     if not db_path:
         return None
     for attempt in range(3):
@@ -1401,38 +1502,259 @@ def _extraer_transcripcion_db(db_path: Optional[str]) -> Optional[str]:
             uri = "file:" + str(db_path).replace("\\", "/") + "?mode=ro"
             con = sqlite3.connect(uri, uri=True, timeout=2)
             try:
-                rows = con.execute(
-                    "SELECT idx, step_payload FROM steps WHERE step_type = 15 "
-                    "ORDER BY idx"
-                ).fetchall()
+                return con.execute(sql).fetchall()
             finally:
                 con.close()
-            break
         except Exception as e:
             if attempt == 2:
-                sys.stderr.write(
-                    f"[agy] WARN _extraer_transcripcion_db: {type(e).__name__}: {e}\n")
+                sys.stderr.write(f"[agy] WARN lectura .db ({sql[:40]}…): "
+                                 f"{type(e).__name__}: {e}\n")
                 return None
             time.sleep(0.3)
+    return None
+
+
+def _uuid_de_conversacion_db(db_path: Optional[str]) -> Optional[str]:
+    """UUID de la conversación según la PROPIA `.db`: `trajectory_meta.cascade_id`.
+
+    Verificado en los 8 bundles testigo legítimos: `cascade_id` coincide exacto
+    con el `Created conversation <uuid>` que agy escribe en su `--log-file`. Es
+    la contraparte independiente del nombre del archivo (que en producción ya es
+    el uuid, pero en un bundle forense se copió como `conversation.db`).
+    None si la tabla no existe o no se pudo leer.
+    """
+    rows = _leer_una_columna_db(db_path, "SELECT cascade_id FROM trajectory_meta")
     if not rows:
         return None
-    payload = rows[-1][1]
-    if payload is None:
+    for (cid,) in rows:
+        if cid:
+            return str(cid).strip().lower()
+    return None
+
+
+def _db_es_de_esta_corrida(db_path: Optional[str],
+                           uuid_log: Optional[str]) -> Optional[bool]:
+    """¿La `.db` elegida es la conversación de ESTA corrida? Tri-estado.
+
+    True  → el uuid del `--log-file` de esta corrida coincide con el de la .db
+            (`cascade_id`) o, si la tabla no es legible, con el nombre del
+            archivo.
+    False → coinciden con algo distinto ⇒ es la conversación de OTRO job.
+    None  → **no verificable** (sin log, sin línea `Created conversation`, o
+            ninguna de las dos vías dio un uuid). No es lo mismo que False, pero
+            los callers tratan ambos igual para el texto: sin identidad probada
+            no se persiste nada como vigente. Es la lección del v33 aplicada acá
+            (tri-estado, no booleano: colapsarlo esconde el "no sé").
+    """
+    u = (uuid_log or "").strip().lower()
+    if not u:
         return None
-    if isinstance(payload, str):
-        payload = payload.encode("utf-8", "replace")
+    cascade = _uuid_de_conversacion_db(db_path)
+    if cascade:
+        return cascade == u
     try:
-        txt = bytes(payload).decode("utf-8", errors="replace")
+        stem = Path(str(db_path)).stem.strip().lower()
     except Exception:
         return None
-    i = txt.find(INI_MARKER)
-    if i == -1:
-        return None
-    j = txt.find(FIN_MARKER, i + len(INI_MARKER))
-    if j == -1:
-        return None
-    seg = txt[i:j + len(FIN_MARKER)]
-    return seg if len(seg) >= MIN_CONTENT_LEN else None
+    if len(stem) == 36 and stem.count("-") == 4:
+        return stem == u
+    return None
+
+
+# Sub-causas que agy deja en los steps de error de la .db. Medidas sobre los
+# bundles del proyecto `agy_texto_descartado` (nada inventado): el string va tal
+# cual aparece en `step_payload` / `error_details` de los steps 17 y 21.
+#   (patrón_lower, etiqueta, reintentable)
+# `reintentable=None` ⇒ lo decide el gate de generación del caller.
+_FIRMAS_ERROR_DB = (
+    ("individual quota reached",            "cuota_individual",        False),
+    ("eligibility check failed",            "eligibility_429",         True),
+    ("unauthenticated",                     "401_unauthenticated",     True),
+    ("code 401",                            "401_unauthenticated",     True),
+    ("invalid_argument (code 400)",         "invalid_argument_400",    False),
+    ("request contains an invalid argument", "invalid_argument_400",   False),
+    ("media has no inline data",            "media_sin_inline_data",   False),
+    ("unsupported mime type",               "mime_no_soportado",       False),
+    ("user denied permission to run command", "tool_denegada_headless", False),
+    ("model produced invalid output",       "model_output_invalido",   None),
+    ("permission_denied",                   "permission_denied",       False),
+    ("model unreachable",                   "model_unreachable",       True),
+)
+# Sólo texto imprimible: los payloads son protobuf crudo con los strings adentro.
+_RE_ASCII_LEGIBLE = re.compile(rb"[\x20-\x7e]{6,}")
+
+
+def _diagnostico_errores_db(db_path: Optional[str]) -> dict:
+    """Etiqueta la causa raíz que agy dejó en la `.db` (v37).
+
+    Hasta v36 nadie leía esto: el `UNAUTHENTICATED 401` y el `eligibility_429`
+    del modo `paste` vivían en la .db y el veredicto salía siempre como el
+    genérico `db_sin_texto_paste`, perdiendo el freno corto de cuenta y el
+    desambigüe pre/post generación del v33.
+
+    Devuelve {"etiqueta": str, "reintentable": bool|None, "detalle": str}.
+    Etiqueta "" = no se encontró ninguna firma conocida.
+    """
+    out = {"etiqueta": "", "reintentable": None, "detalle": ""}
+    rows = _leer_una_columna_db(
+        db_path,
+        "SELECT idx, step_type, step_payload, error_details FROM steps "
+        "WHERE step_type IN (17, 21, 23) ORDER BY idx")
+    if not rows:
+        return out
+    for idx, step_type, payload, error_details in rows:
+        for blob in (error_details, payload):
+            if not blob:
+                continue
+            if isinstance(blob, str):
+                blob = blob.encode("utf-8", "replace")
+            try:
+                txt = b" ".join(_RE_ASCII_LEGIBLE.findall(bytes(blob))).decode(
+                    "ascii", "replace")
+            except Exception:
+                continue
+            bajo = txt.lower()
+            for needle, etiqueta, reintentable in _FIRMAS_ERROR_DB:
+                if needle in bajo:
+                    pos = bajo.find(needle)
+                    out["etiqueta"]     = etiqueta
+                    out["reintentable"] = reintentable
+                    out["detalle"]      = txt[max(0, pos - 40): pos + 200].strip()[:300]
+                    return out
+    return out
+
+
+def _extraer_transcripcion_db(db_path: Optional[str]) -> dict:
+    """Mejor candidato a transcripción dentro de la `.db` de conversación.
+
+    v34 lo introdujo para el modo `paste` (donde la pantalla NO es fuente
+    válida: el TUI renderiza el markdown y DESTRUYE los tags `<ilegible>`/
+    `<dudoso>` — medido 271 vs 0). v37 lo generaliza a los 3 modos como camino
+    de RESCATE y arregla dos defectos:
+
+      1) **Leía sólo el ÚLTIMO `step_type=15`.** Cuando el error deja un step 15
+         vacío al final (238 bytes en el job 70839), el par INICIO/FIN quedaba
+         en un step anterior y se tiraba la transcripción entera. Ahora recorre
+         en REVERSA y se queda con el primer candidato que tenga página adentro.
+      2) **Exigía el par INICIO…FIN completo.** Un texto truncado se descartaba
+         entero, cuando en `-p`/`-i` ese mismo caso se rescata como `ini_only` y
+         PHP lo marca con `qaDetectarSinFin()`. Ahora el parcial vuelve como
+         `fuente="db_parcial"` y PHP hace lo suyo.
+
+    Devuelve SIEMPRE un dict (nunca None), porque el candidato viaja al raw
+    aunque se rechace — el texto crudo que produjo agy no se tira nunca:
+      - `texto`     : segmento aceptado (con ambos marcadores si los tenía), o None.
+      - `fuente`    : "db" | "db_parcial" | "".
+      - `candidato` : mejor segmento hallado, PASE O NO las guardas (para el raw).
+      - `rechazo`   : motivo por el que no se aceptó ("" si se aceptó o no había nada).
+      - `marcas`    : marcas de página del segmento elegido (ver
+                      `_marcas_pagina_en_segmento`).
+      - `step_idx`  : índice del step del que salió.
+
+    OJO: la identidad de la .db NO se chequea acá (este helper no conoce el
+    logfile). La gatea el caller con `_db_es_de_esta_corrida` — sin eso, esto
+    devuelve felizmente la transcripción de otra página.
+    """
+    out = {"texto": None, "fuente": "", "candidato": None, "rechazo": "",
+           "marcas": 0, "step_idx": None, "razonamiento": False}
+    rows = _leer_una_columna_db(
+        db_path,
+        "SELECT idx, step_payload FROM steps WHERE step_type = 15 ORDER BY idx")
+    if rows is None:
+        out["rechazo"] = "db_ilegible"
+        return out
+    if not rows:
+        out["rechazo"] = "sin_step_15"
+        return out
+
+    mejor_candidato = None       # (len, seg, idx, fuente, marcas)
+    for idx, payload in reversed(rows):
+        if payload is None:
+            continue
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8", "replace")
+        try:
+            txt = bytes(payload).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        i = txt.find(INI_MARKER)
+        if i == -1:
+            continue
+        j = txt.find(FIN_MARKER, i + len(INI_MARKER))
+        if j != -1:
+            seg    = txt[i: j + len(FIN_MARKER)]
+            fuente = "db"
+        else:
+            # Parcial: cortar en el SEGUNDO INICIO si lo hay. El payload trae el
+            # texto dos veces (medido en v34), así que sin este corte el rescate
+            # de un truncado devolvería el arranque duplicado.
+            k   = txt.find(INI_MARKER, i + len(INI_MARKER))
+            seg = txt[i: k] if k != -1 else txt[i:]
+            fuente = "db_parcial"
+        seg = seg.strip()
+        if len(seg) < MIN_CONTENT_LEN:
+            continue
+        marcas = _marcas_pagina_en_segmento(seg)
+        if mejor_candidato is None or len(seg) > mejor_candidato[0]:
+            mejor_candidato = (len(seg), seg, idx, fuente, marcas)
+        if marcas >= 1:
+            out.update({"texto": seg, "fuente": fuente, "candidato": seg,
+                        "rechazo": "", "marcas": marcas, "step_idx": int(idx),
+                        "razonamiento": _hay_razonamiento_en_segmento(seg)})
+            return out
+
+    if mejor_candidato is None:
+        out["rechazo"] = "sin_par_inicio"
+        return out
+    # Hubo segmento pero sin una sola marca de página: es razonamiento del modelo
+    # citando los marcadores. Viaja al raw, no a `entradas`.
+    out.update({"candidato": mejor_candidato[1], "marcas": mejor_candidato[4],
+                "step_idx": int(mejor_candidato[2]),
+                "razonamiento": _hay_razonamiento_en_segmento(mejor_candidato[1]),
+                "rechazo": "sin_contenido_de_pagina"})
+    return out
+
+
+def resolver_texto_db(db_path: Optional[str],
+                      uuid_log: Optional[str],
+                      hubo_generacion: Optional[bool]) -> dict:
+    """Punto ÚNICO de decisión "¿este texto de la .db se puede persistir?" (v37).
+
+    Junta el extractor con las dos guardas de AUTORÍA del §4 del handoff, para
+    que `main()` y el harness de tests corran exactamente el mismo código (si el
+    test replicara el gateo, validaría su propia copia, no el motor).
+
+      guarda 1 — generación propia : `streamGenerateContent ≥ 1` en el
+                 `--log-file` de ESTA corrida (`hubo_generacion`). Tri-estado.
+      guarda 2 — identidad         : el uuid del log == el de la .db.
+      (guarda 3 — que el segmento tenga página adentro — vive en el extractor,
+       vía `_marcas_pagina_en_segmento`.)
+
+    Las tres en conjunción. "No verificable" (None) pesa igual que "no" para
+    persistir: sin poder probar de quién es el texto, no se escribe como
+    transcripción vigente. El candidato vuelve igual en `candidato` para que el
+    raw lo conserve.
+
+    Devuelve dict: texto, fuente, candidato, rechazo, marcas, step_idx, identidad.
+    """
+    try:
+        out = _extraer_transcripcion_db(db_path)
+    except Exception as e:
+        sys.stderr.write(f"[agy] WARN _extraer_transcripcion_db: {type(e).__name__}: {e}\n")
+        out = {"texto": None, "fuente": "", "candidato": None,
+               "rechazo": "extractor_excepcion", "marcas": 0, "step_idx": None}
+    identidad = _db_es_de_esta_corrida(db_path, uuid_log)
+    out["identidad"] = identidad
+    if out.get("texto"):
+        if identidad is not True:
+            out["rechazo"] = ("db_de_otra_conversacion" if identidad is False
+                              else "identidad_no_verificable")
+            out["texto"], out["fuente"] = None, ""
+        elif hubo_generacion is not True:
+            out["rechazo"] = ("sin_generacion_propia" if hubo_generacion is False
+                              else "generacion_no_verificable")
+            out["texto"], out["fuente"] = None, ""
+    return out
 
 
 def _png_en_gen_metadata(db_path: Optional[str]) -> Optional[bool]:
@@ -2670,13 +2992,25 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
                             el que tiene el path del log.
       - `imagen_tripleta` : bool — señal vieja (v28) cruda, para forense.
       - `imagen_png_media`: bool|None — PNG en `gen_metadata`, cruda.
+      - `db_via`          : "uuid" | "mtime" | "" — cómo se eligió la .db (v37).
+      - `db_identidad_ok` : bool|None — ¿la .db es de ESTA corrida? (v37).
+
+    ── v37: las señales derivadas también se gatean por identidad ──────────────
+    Hasta v36, si la vía (2) elegía la .db de otro job, `imagen_cargada`,
+    `websearch` y `citation_urls` viajaban al shape igual — y `imagen_cargada`
+    dispara el QA grave `no_cargo_imagen`. Medido: 11 bundles con .db ajena.
+    Ahora, si la identidad no da True, este helper devuelve las señales en
+    NEUTRO (listas vacías, tri-estados en None = "no verificable", que es lo que
+    PHP ya sabe interpretar sin disparar QA) y deja `db_path` poblado para que
+    el bundle forense igual se lleve la .db.
 
     Best-effort: cualquier excepción → dict con listas vacías, db_path=None,
     imagen_cargada=None.
     """
     out = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": [],
            "citation_urls": [], "imagen_cargada": None,
-           "imagen_tripleta": False, "imagen_png_media": None}
+           "imagen_tripleta": False, "imagen_png_media": None,
+           "db_via": "", "db_identidad_ok": None}
 
     # ── Vía 1 (preferida): UUID exacto del logfile ──
     steps_strings = None  # [(idx, printable_str_blob), ...]
@@ -2690,6 +3024,7 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
                 chosen_db = cand
                 chosen_rows = rows
                 steps_strings = _steps_a_strings(rows)
+                out["db_via"] = "uuid"
 
     # ── Vía 2 (fallback): scan por mtime, elegir la de más steps ──
     if steps_strings is None:
@@ -2713,8 +3048,22 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
         if best is None:
             return out
         chosen_db, steps_strings, chosen_rows = best[0], best[1], best[2]
+        out["db_via"] = "mtime"
 
     out["db_path"] = chosen_db
+
+    # ── Guarda de IDENTIDAD (v37) ────────────────────────────────────────────
+    # Sin esto, la vía (2) puede haber elegido la conversación de otro job y
+    # todo lo que sigue describiría a esa otra corrida. `db_path` queda poblado
+    # a propósito: el bundle forense se lleva la .db igual, para poder auditar.
+    out["db_identidad_ok"] = _db_es_de_esta_corrida(chosen_db, uuid_conversacion)
+    if out["db_identidad_ok"] is not True:
+        sys.stderr.write(
+            f"[agy] .db SIN identidad probada (via={out['db_via']}, "
+            f"identidad={out['db_identidad_ok']}, "
+            f"db={os.path.basename(chosen_db) if chosen_db else 'None'}) → "
+            f"señales derivadas en neutro (no verificable)\n")
+        return out
 
     # ── Citations del checker de atribución/recitación (bump v30) ──
     # Se extraen ANTES del loop de URLs porque sus hosts se excluyen de
@@ -3097,6 +3446,80 @@ def volcar_debug_bundle(debug_dir: Path, res: CaptureResult, metrics: dict,
 # DECISIÓN DE VEREDICTO Y SHAPE DE SALIDA
 # ============================================================
 
+def _mejor_fuente(res: CaptureResult) -> tuple:
+    """Jerarquía de fuentes del `response`: (texto, fuente, fin_presente).
+
+    Un solo lugar que responde "¿qué texto tenemos?", para que los caminos de
+    fallo puedan preguntarlo ANTES de decidir que no hay nada (v37). Hasta v36
+    la jerarquía vivía inline en `decidir_veredicto` y los bloques de cuota /
+    excepción retornaban antes de llegar a ella: por eso una corrida que
+    terminaba bien y recibía el 429 DESPUÉS devolvía `response=""`.
+
+      paste : SÓLO la .db. La pantalla no es fallback válido — el TUI renderiza
+              el markdown y destruye los tags `<ilegible>`/`<dudoso>` (medido:
+              271 vs 0). Invariante del v34, no tocar.
+      -p/-i : partial_from_ini → **.db (v37)** → history → screen.
+              La .db entra como RESCATE por encima de history porque cuando el
+              grid quedó vacío pero el modelo generó (job68768: TIMEOUT a los
+              600 s con 19.316 ch en la .db) el texto está ahí y sólo ahí.
+
+    `res.response_db` ya viene gateado por identidad + generación desde main():
+    lo que llega acá es texto cuya autoría está probada.
+    """
+    if getattr(res, "paste_modo", False):
+        db_txt = (getattr(res, "response_db", None) or "").strip()
+        if db_txt and len(db_txt) >= MIN_CONTENT_LEN:
+            return (db_txt, getattr(res, "db_fuente", "") or "db",
+                    FIN_MARKER in db_txt)
+        return ("", "vacio", False)
+
+    partial = (res.partial_from_ini or "").strip()
+    if partial and len(partial) >= MIN_CONTENT_LEN:
+        return (partial, "ini_fin" if res.fin_visto else "ini_only",
+                bool(res.fin_visto))
+    db_txt = (getattr(res, "response_db", None) or "").strip()
+    if db_txt and len(db_txt) >= MIN_CONTENT_LEN:
+        return (db_txt, getattr(res, "db_fuente", "") or "db",
+                FIN_MARKER in db_txt)
+    history = (res.history_text or "").strip()
+    if history and len(history) >= MIN_CONTENT_LEN:
+        return (history, "history", False)
+    screen = (res.screen_snapshot or "").strip()
+    if screen and len(screen) >= MIN_CONTENT_LEN:
+        return (screen, "screen", False)
+    return ("", "vacio", False)
+
+
+# Fuentes que cuentan como RESCATE. La lista es corta a propósito: son las que
+# llevan los marcadores del prompt (o salen de la .db, que es la fuente
+# estructurada). `history`/`screen` NO entran — un mensaje de chrome del TUI de
+# 47 chars ("Error: Agent execution terminated due to error.") pasa el piso de
+# MIN_CONTENT_LEN=20 y no es una transcripción: tratarlo como rescate convertía
+# un veredicto CUOTA legítimo en un OK-con-texto-basura que después las firmas
+# de `shape_salida` degradaban a ERROR, perdiendo la etiqueta de cuota.
+# (Medido: job69869 intento 1, `history_text` de 47 chars.)
+_FUENTES_RESCATABLES = ("ini_fin", "ini_only", "db", "db_parcial")
+
+
+def _motivo_rescate(camino: str, fuente: str, res: "CaptureResult" = None) -> str:
+    """Etiqueta del camino de rescate → `rescate_motivo` del shape → QA grave
+    `texto_rescatado` en prensa. `camino` vacío + texto limpio ⇒ "" (sin QA).
+
+    Se compone con `+`: además del camino, marca las dos propiedades del texto
+    que un humano tiene que confirmar — que vino truncado y que trae
+    razonamiento del modelo mezclado. Ojo: `thinking_mezclado` es una ETIQUETA,
+    no un filtro; el texto se persiste igual (el fragmento de página real vale
+    más que la prolijidad) y el QA grave lo manda a revisión.
+    """
+    partes = [p for p in (camino,) if p]
+    if fuente == "db_parcial":
+        partes.append("parcial_sin_fin")
+    if res is not None and getattr(res, "db_razonamiento", False) and \
+            str(fuente).startswith("db"):
+        partes.append("thinking_mezclado")
+    return "+".join(partes)
+
+
 def decidir_veredicto(res: CaptureResult) -> tuple:
     """Mapea CaptureResult → (veredicto, response, error, fin_presente, fuente_response).
 
@@ -3125,20 +3548,66 @@ def decidir_veredicto(res: CaptureResult) -> tuple:
       OK    : response no vacío (cualquier fuente).
       ERROR : spawn falló, o todas las fuentes vacías.
       CUOTA : reservado (no se detecta auto todavía; handoff #4).
+
+    v37 (proyecto `agy_texto_descartado`): NINGUNA señal de error vacía el
+    `response` sin antes preguntar si ya había texto capturado. La jerarquía se
+    evalúa UNA vez arriba (`_mejor_fuente`) y todos los caminos de fallo la
+    consultan. Cuando el texto entra por un camino de rescate se cuelga
+    `res.rescate_motivo`, que viaja al shape y prensa convierte en QA grave.
     """
-    if res.estado == "ERROR_SPAWN":
+    # ── Fix 5 (v37) — fallo de spawn GENUINO ─────────────────────────────────
+    # `estado == "ERROR_SPAWN"` sin `spawn_ok` es el único caso en que podemos
+    # AFIRMAR que agy no arrancó. Con `spawn_ok` es una excepción de fase (el
+    # proceso corrió y pudo haber generado): se trata más abajo.
+    if res.estado == "ERROR_SPAWN" and not getattr(res, "spawn_ok", False):
         return ("ERROR", "", res.error or "spawn_agy_fallo", False, "vacio")
 
+    excepcion_fase = (
+        res.estado == "EXCEPCION_FASE"
+        or (res.estado == "ERROR_SPAWN" and getattr(res, "spawn_ok", False)))
+
+    texto, fuente, fin_presente = _mejor_fuente(res)
+    hay_texto = bool(texto)
+    hubo_gen  = getattr(res, "hubo_generacion", None)
+
     # 0) Cuota agotada (HTTP 429): si `_detectar_cuota_en_conversacion` halló
-    #    el RESOURCE_EXHAUSTED en la .db de esta corrida, devolvemos CUOTA
-    #    antes que cualquier otra cosa. Con esto el wrapper PHP (lib_agy +
-    #    worker) ya no ve `agy_exit_sin_datos` enmascarando un 429, sino el
-    #    veredicto correcto → cooldown + rotación. El `cuota_reset_seg` lo
-    #    leva shape_salida al dict de salida.
+    #    el RESOURCE_EXHAUSTED en la .db de esta corrida.
+    #
+    #    v37 — Fix 1: el 429 puede llegar DESPUÉS de que la corrida terminó bien
+    #    (job69869: `estado=OK_FIN`, 21.812 ch completos, y el 429 en el step de
+    #    error posterior). Hasta v36 esto devolvía `response=""` y el worker no
+    #    tenía con qué reparar: la página se perdía y el job volvía a la cola.
+    #    Ahora, si hay texto, se devuelve OK **sin perder la señal de cuota**:
+    #    `shape_salida` marca `cuota_agotada=true` mirando `res.cuota_detectada`,
+    #    no el veredicto, así el cooldown y la rotación siguen disparando. Son
+    #    dos efectos independientes, no un if/else.
     if getattr(res, "cuota_detectada", False):
+        if hay_texto and fuente in _FUENTES_RESCATABLES:
+            res.rescate_motivo = _motivo_rescate("cuota_post_generacion", fuente, res)
+            return ("OK", texto, None, fin_presente, fuente)
         return ("CUOTA", "",
                 "cuota_agotada: 429 RESOURCE_EXHAUSTED (Individual quota reached)",
                 False, "cuota")
+
+    # 0.2) EXCEPCIÓN DE FASE (v37 — Fix 5). El proceso arrancó y una fase
+    #      posterior tiró excepción (`EOFError: Pty is closed` del job 70926).
+    #      Es INFRAESTRUCTURA: no depende del contenido de la página, así que
+    #      es reintentable. Pero primero se rescata: si el PTY murió durante el
+    #      drenaje, el modelo pudo haber terminado y escrito la .db.
+    if excepcion_fase:
+        if hay_texto and fuente in _FUENTES_RESCATABLES:
+            res.rescate_motivo = _motivo_rescate("excepcion_fase", fuente, res)
+            return ("OK", texto, None, fin_presente, fuente)
+        # El sufijo pre/post generación NO cambia el veredicto (el cap de 3
+        # reintentos acota el gasto y el fallo es del PTY, no del backend), pero
+        # queda en `api_errorlog` para que un patrón postgen sea visible.
+        sufijo = "postgen" if hubo_gen else "pregen"
+        return ("TRANSITORIO", "",
+                (f"excepcion_fase_{sufijo}: agy arrancó y una fase posterior tiró "
+                 f"excepción ({res.error or 'sin detalle'}); no quedó texto "
+                 f"rescatable [estado={res.estado} dur={res.duracion_seg}s]. "
+                 f"Es infraestructura (PTY/portapapeles), reintentable"),
+                False, "vacio")
 
     # 0.5) MODO `paste` (bump v34): la fuente del texto es la .db, NO la pantalla.
     #      WORKAROUND TEMPORAL — bug upstream agy #735 (LS 1.1.10 manda
@@ -3158,9 +3627,13 @@ def decidir_veredicto(res: CaptureResult) -> tuple:
                      "mensaje ⇒ cero cuota consumida. Causa típica: algo pisó el "
                      "portapapeles en la ventana crítica. Reintentable"),
                     False, "vacio")
-        db_txt = (getattr(res, "response_db", None) or "").strip()
-        if db_txt and len(db_txt) >= MIN_CONTENT_LEN:
-            return ("OK", db_txt, None, (FIN_MARKER in db_txt), "db")
+        if hay_texto:
+            # Camino normal del modo paste. Sólo se etiqueta como rescate si el
+            # texto vino truncado (`parcial_sin_fin`) o con razonamiento
+            # mezclado (`thinking_mezclado`): ahí PHP suma el QA grave para que
+            # un humano lo confirme. Texto limpio ⇒ motivo "" ⇒ sin QA extra.
+            res.rescate_motivo = _motivo_rescate("", fuente, res)
+            return ("OK", texto, None, fin_presente, fuente)
         if getattr(res, "loop_detectado", False):
             # Excepción explícita: si el detector de loop disparó, el motivo
             # correcto es el de siempre (el CLI se colgó repitiendo), no el de
@@ -3171,30 +3644,78 @@ def decidir_veredicto(res: CaptureResult) -> tuple:
                      f"dejó transcripción [estado={res.estado} "
                      f"dur={res.duracion_seg}s]"),
                     False, "vacio")
+
+        # ── Fix 3 (v37): dejar de colapsar TODO fallo de paste en un solo
+        #    rótulo. Hasta v36, cualquier corrida sin texto salía como
+        #    `db_sin_texto_paste` + TRANSITORIO, con dos consecuencias medidas:
+        #    (a) un `eligibility_429` perdía el freno corto de cuenta y el
+        #        worker martillaba un backend que decía RESOURCE_EXHAUSTED;
+        #    (b) un fallo POSTERIOR a la generación se reintentaba a ciegas —
+        #        el patrón exacto que el v33 arregló en la otra rama y que el
+        #        2026-08-03 quemó 724 jobs contra un INVALID_ARGUMENT 400
+        #        determinístico.
+        #    Ahora se consultan las dos evidencias que ya existían y nadie leía:
+        #    la sub-causa de la .db (`_diagnostico_errores_db`) y el gate de
+        #    generación del `--log-file` (tri-estado: log ilegible → TRANSITORIO,
+        #    conservador; colapsarlo a booleano reintroduce el bug del v33).
+        diag         = getattr(res, "diag_db", None) or {}
+        etiqueta     = str(diag.get("etiqueta") or "")
+        reintentable = diag.get("reintentable")
+        detalle      = str(diag.get("detalle") or "")[:200]
+        det_txt      = f" Detalle de la .db: {detalle}" if detalle else ""
+        ctx          = (f"[estado={res.estado} dur={res.duracion_seg}s "
+                        f"generacion={hubo_gen}]")
+
+        if etiqueta == "cuota_individual":
+            # La .db dice cuota agotada aunque `_detectar_cuota_en_conversacion`
+            # no la haya visto (p.ej. no pudo parsear el "Resets in …"). Vale
+            # más el cooldown que un ERROR: el job vuelve a la cola sin consumir
+            # intento y la cuenta descansa.
+            return ("CUOTA", "",
+                    f"cuota_agotada: firma 'Individual quota reached' en la .db "
+                    f"de esta corrida.{det_txt}", False, "cuota")
+        if reintentable is True:
+            return ("TRANSITORIO", "",
+                    (f"{etiqueta}: agy no dejó transcripción en la .db y la causa "
+                     f"raíz es reintentable (sin consumo de generación o auth "
+                     f"stale). {ctx}{det_txt}"),
+                    False, "vacio")
+        if reintentable is False:
+            return ("ERROR", "",
+                    (f"{etiqueta}: agy no dejó transcripción en la .db y la causa "
+                     f"raíz es DETERMINÍSTICA — reintentar repite el gasto sin "
+                     f"cambiar el resultado. {ctx}{det_txt}"),
+                    False, "vacio")
+        # Sin firma conocida (o firma ambigua) → manda el gate de generación.
+        if hubo_gen is True:
+            return ("ERROR", "",
+                    (f"db_sin_texto_paste_postgen: agy llegó a llamar a "
+                     f"streamGenerateContent (hubo consumo) y la .db no dejó par "
+                     f"INICIO/FIN. NO es un fallo de arranque: reintentar repite "
+                     f"el gasto. Terminal — mirar el bundle forense. "
+                     f"{ctx}{det_txt}"),
+                    False, "vacio")
         return ("TRANSITORIO", "",
                 (f"db_sin_texto_paste: no se pudo extraer la transcripción de la "
-                 f"conversation.db (sin step 15, sin par INICIO/FIN, o .db "
-                 f"ilegible) y en modo paste la pantalla NO es fallback válido "
-                 f"(el TUI destruye los tags <ilegible>/<dudoso>). "
-                 f"[estado={res.estado} dur={res.duracion_seg}s]"),
+                 f"conversation.db (sin step 15, sin par INICIO/FIN, .db ilegible "
+                 f"o sin identidad probada) y en modo paste la pantalla NO es "
+                 f"fallback válido (el TUI destruye los tags <ilegible>/<dudoso>). "
+                 f"Sin generación registrada ⇒ reintentable. {ctx}{det_txt}"),
                 False, "vacio")
 
-    # 1) Camino preferido: hubo INICIO_MARKER en el history.
-    partial = (res.partial_from_ini or "").strip()
-    if partial and len(partial) >= MIN_CONTENT_LEN:
-        fuente = "ini_fin" if res.fin_visto else "ini_only"
-        return ("OK", partial, None, bool(res.fin_visto), fuente)
-
-    # 2) Sin INICIO: caemos al history limpio (de-renderizado por pyte). PHP
-    #    discrimina con QA bits según `fuente_response`.
-    history = (res.history_text or "").strip()
-    if history and len(history) >= MIN_CONTENT_LEN:
-        return ("OK", history, None, False, "history")
-
-    # 3) Último recurso: snapshot de la pantalla visible.
-    screen = (res.screen_snapshot or "").strip()
-    if screen and len(screen) >= MIN_CONTENT_LEN:
-        return ("OK", screen, None, False, "screen")
+    # 1-3) Jerarquía de fuentes (pantalla + .db) ya resuelta arriba por
+    #      `_mejor_fuente`. La .db como fuente en `-p`/`-i` es camino de RESCATE
+    #      (v37): el grid quedó vacío y el texto sobrevivió sólo en SQLite.
+    if hay_texto:
+        if fuente.startswith("db"):
+            if res.estado == "TIMEOUT":
+                camino = "timeout_con_db"
+            elif res.estado in ("PROC_EXIT", "LOOP_DEGENERADO"):
+                camino = "exit_con_db"
+            else:
+                camino = "db_rescate"
+            res.rescate_motivo = _motivo_rescate(camino, fuente, res)
+        return ("OK", texto, None, fin_presente, fuente)
 
     # 3.5) Fallo de ARRANQUE transitorio (pre-generación → sin cuota consumida):
     #      backend 500 al resolver el modelo, auth/keyring timeout, etc. Sólo
@@ -3266,6 +3787,25 @@ def shape_salida(
     """
     veredicto, response, error, fin_presente, fuente_response = decidir_veredicto(res)
     ok = (veredicto == "OK")
+
+    # ── EL RAW NUNCA SE TIRA (v37) ───────────────────────────────────────────
+    # Si el veredicto no es OK y no hay `response`, pero la .db SÍ tenía un
+    # segmento que no pasó las guardas (razonamiento del modelo citando los
+    # marcadores, o una .db que no es de esta corrida), ese texto viaja igual —
+    # con un encabezado que dice por qué no se persistió. El worker lo escribe
+    # en `api_rawresponse` (rama !ok) y NUNCA llega a `entradas`: la rama de
+    # persistencia es la de ok=true. Sin esto, el único lugar donde sobrevivía
+    # era el bundle forense, y sólo si el bundle llegaba a archivarse.
+    if not ok and not (response or "").strip():
+        _cand = (getattr(res, "db_candidato", None) or "").strip()
+        if _cand:
+            _why = getattr(res, "db_rechazo", "") or "no_persistido"
+            response = (
+                f"[texto_no_persistido: {_why}] Segmento hallado en la .db de "
+                f"conversación que NO se persistió como transcripción. "
+                f"Auditoría únicamente — verificar el bundle forense antes de "
+                f"reinyectarlo a mano.\n{_cand}"
+            )
 
     # ── LOOP DEGENERADO DE SALIDA (bump v31) ──────────────────────────────────
     # `capturar()` cortó porque agy quedó repitiendo una unidad corta. Acá se
@@ -3546,7 +4086,14 @@ def shape_salida(
         "session_id": None,
         "stdout_raw": stdout_capado,
         "stderr_raw": "",
-        "cuota_agotada": (veredicto == "CUOTA"),
+        # v37 — Fix 1: la cuota es un HECHO de la corrida, no un veredicto. Una
+        # corrida puede terminar OK y recibir el 429 después (job69869): ahí el
+        # texto se persiste Y la cuenta entra en cooldown. Son dos efectos
+        # independientes; leer esto como `veredicto === 'CUOTA'` los ata y hace
+        # perder uno de los dos. `agyAccionResultado` sigue mapeando a CUOTA en
+        # la rama de fallo, y el camino OK lo consume el worker aparte.
+        "cuota_agotada": (veredicto == "CUOTA"
+                          or bool(getattr(res, "cuota_detectada", False))),
         # Segundos hasta el reset de cuota (parseado de "Resets in 13m27s" en el
         # 429 de la .db). 0 si no se pudo parsear o no aplica → el worker usará
         # el default `agy_cooldown_seg` como fallback.
@@ -3648,6 +4195,30 @@ def shape_salida(
             None if getattr(res, "media_en_log", None) is None
             else int(res.media_en_log)
         ),
+        # ── RESCATE DE TEXTO (v37, proyecto `agy_texto_descartado`) ───────────
+        # `rescate_motivo` != "" ⇒ el texto que se está persistiendo NO vino por
+        # el camino normal: entró por un camino que hasta v36 lo tiraba. Valores
+        # observables (se combinan con `+`):
+        #   cuota_post_generacion → la corrida terminó y el 429 llegó después.
+        #   timeout_con_db / exit_con_db → el grid quedó vacío y el texto estaba
+        #     sólo en la .db de la conversación.
+        #   excepcion_fase        → una fase posterior al spawn tiró excepción.
+        #   parcial_sin_fin       → el texto vino truncado (INICIO sin FIN).
+        # prensa lo convierte en el QA grave `texto_rescatado` ⇒ la página cae en
+        # revisión humana en vez de mezclarse con las transcripciones sanas, y el
+        # bundle forense se archiva en vez de borrarse.
+        "rescate_motivo": str(getattr(res, "rescate_motivo", "") or ""),
+        # Forense de la .db (v37). `db_identidad_ok` tri-estado: True = la .db es
+        # de ESTA corrida (cascade_id == uuid del logfile); False = es de otra
+        # conversación; None = no verificable. Con != True no se persiste texto
+        # NI se propagan las señales derivadas (imagen_cargada, websearch,
+        # citations): viajan en neutro.
+        "db_identidad_ok": (
+            None if getattr(res, "db_identidad_ok", None) is None
+            else bool(res.db_identidad_ok)
+        ),
+        "db_rechazo":       str(getattr(res, "db_rechazo", "") or ""),
+        "db_marcas_pagina": int(getattr(res, "db_marcas_pagina", 0) or 0),
         "fecha_iso": datetime.now().isoformat(timespec='seconds'),
     }
 
@@ -4065,7 +4636,12 @@ def main() -> int:
     # `notas/agy_1.1.3_permisos_read_file.md §5ª ronda` para el contexto.
     _db_info = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": [],
                 "citation_urls": [], "imagen_cargada": None,
-                "imagen_tripleta": False, "imagen_png_media": None}
+                "imagen_tripleta": False, "imagen_png_media": None,
+                "db_via": "", "db_identidad_ok": None}
+    # Inicializado FUERA del try: si la lectura del log revienta, `_uuid` tiene
+    # que existir igual — lo consume `resolver_texto_db` más abajo (sin esto,
+    # un NameError tumbaría el job entero en vez de degradar a "no verificable").
+    _uuid: Optional[str] = None
     try:
         # UUID de conversación del `agy_logfile.log` de ESTA corrida (v24) —
         # 100% determinístico. Si no hay log (agy no arrancó / --log-file
@@ -4120,20 +4696,54 @@ def main() -> int:
     # que el prompt de producción exige (medido: 271 en la .db vs 0 en el grid),
     # y cols=220 wrapea la prosa. Si la .db no da texto NO se cae a la pantalla:
     # `decidir_veredicto` devuelve TRANSITORIO/`db_sin_texto_paste`.
+    # v37: el texto de la .db se busca en LOS TRES MODOS. En `paste` es la
+    # fuente (v34); en `-p`/`-i` es camino de RESCATE, para los casos donde el
+    # grid quedó vacío y la transcripción sobrevivió sólo en SQLite (job68768:
+    # TIMEOUT de 600 s con 19.316 ch en la .db, hoy ERROR terminal).
+    # Las guardas de autoría viven en `resolver_texto_db` (mismo código que
+    # corre el harness de tests). El candidato viaja SIEMPRE aunque se rechace:
+    # shape_salida lo manda al `response` cuando el veredicto no es OK, y de ahí
+    # a `api_rawresponse`. El texto crudo que produjo agy no se tira nunca; lo
+    # que se decide acá es sólo si además se puede PERSISTIR como vigente.
+    _extr = resolver_texto_db(_db_info.get("db_path"), _uuid, res.hubo_generacion)
+    res.db_identidad_ok  = _extr.get("identidad")
+    res.db_candidato     = _extr.get("candidato")
+    res.db_marcas_pagina = int(_extr.get("marcas") or 0)
+    res.db_razonamiento  = bool(_extr.get("razonamiento"))
+    res.db_rechazo       = str(_extr.get("rechazo") or "")
+    _txt_db              = _extr.get("texto")
+    res.response_db      = _txt_db
+    res.db_fuente        = str(_extr.get("fuente") or "") if _txt_db else ""
+    sys.stderr.write(
+        f"[agy] texto de la .db: {len(_txt_db) if _txt_db else 0} chars "
+        f"aceptados (candidato={len(res.db_candidato or '')} ch, "
+        f"fuente={res.db_fuente or '-'}, marcas_pagina={res.db_marcas_pagina}, "
+        f"step={_extr.get('step_idx')}, rechazo={res.db_rechazo or '-'}, "
+        f"identidad={res.db_identidad_ok}, generacion={res.hubo_generacion})\n"
+    )
+
     if args.cmd_mode == "paste":
-        _txt_db = None
-        try:
-            _txt_db = _extraer_transcripcion_db(_db_info.get("db_path"))
-        except Exception as _e:
-            sys.stderr.write(f"[agy] WARN _extraer_transcripcion_db: {_e}\n")
-        res.response_db = _txt_db
         sys.stderr.write(
-            f"[agy] paste: texto de la .db = "
-            f"{len(_txt_db) if _txt_db else 0} chars "
-            f"(chip={getattr(res, 'paste_chip_detectado', False)} "
+            f"[agy] paste: chip={getattr(res, 'paste_chip_detectado', False)} "
             f"reintentos={getattr(res, 'paste_reintentos', 0)} "
-            f"clipboard_restaurado={getattr(res, 'clipboard_restaurado', False)})\n"
+            f"clipboard_restaurado={getattr(res, 'clipboard_restaurado', False)}\n"
         )
+        if not _txt_db and res.db_identidad_ok is True:
+            # Sub-causa de la .db para el desambigüe del Fix 3 (v37). Dos gates:
+            #   - sólo cuando NO hay texto (en el camino feliz sería una consulta
+            #     SQLite de más por job — lección de performance del v35);
+            #   - sólo con identidad probada: el error de OTRA conversación
+            #     etiquetaría mal esta corrida, que es el mismo pecado que el
+            #     texto ajeno. Sin identidad, decide el gate de generación (que
+            #     sale del `--log-file` propio y no de la .db).
+            try:
+                res.diag_db = _diagnostico_errores_db(_db_info.get("db_path"))
+            except Exception as _e:
+                res.diag_db = {}
+                sys.stderr.write(f"[agy] WARN _diagnostico_errores_db: {_e}\n")
+            sys.stderr.write(f"[agy] paste sin texto → diagnostico .db: "
+                             f"{(res.diag_db or {}).get('etiqueta') or '(sin firma)'}\n")
+
         if (not _txt_db
                 and res.estado != "PASTE_SIN_CHIP"
                 and not getattr(res, "loop_detectado", False)
@@ -4144,8 +4754,15 @@ def main() -> int:
             # shape_salida vía `firma_transitorio_motivo_forzado`; un fallo de
             # arranque ya etiquetado por `_detectar_arranque_transitorio` es más
             # específico que éste y gana).
+            # v37: si la .db nombró una causa raíz reintentable (`eligibility_429`,
+            # `401_unauthenticated`), ESA es la etiqueta — es la que dispara el
+            # freno corto de cuenta en prensa (`agyFrenarCuentaPorRateLimit`).
+            _diag = getattr(res, "diag_db", None) or {}
             res.transitorio_detectado = True
-            res.transitorio_motivo = "db_sin_texto_paste"
+            res.transitorio_motivo = (
+                str(_diag.get("etiqueta") or "") if _diag.get("reintentable") is True
+                else "db_sin_texto_paste"
+            )
     # v30: citations del checker de atribución/recitación → shape → PHP.
     res.citation_urls = _db_info.get("citation_urls") or []
 

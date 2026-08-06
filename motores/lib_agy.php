@@ -536,7 +536,15 @@ function ejecutarAgy(
 
     $data      = $resp['data'] ?? [];
     $veredicto = $data['veredicto'] ?? null;
-    $cuota     = ($veredicto === 'CUOTA');
+    // v37: la cuota es un HECHO de la corrida, no un veredicto. Desde el core
+    // v37 el `.py` puede devolver `veredicto=OK` (transcripción rescatada) CON
+    // `cuota_agotada=true` — el 429 llegó DESPUÉS de que el modelo terminó de
+    // generar (job69869: `OK_FIN` + 21.812 chars y el 429 en el step siguiente).
+    // Leer sólo el veredicto ataría los dos efectos y se perdería uno: o el
+    // texto (como hasta v36) o el cooldown de la cuenta. El caller PHP tiene que
+    // poder aplicar los dos. Core viejo: la clave siempre venía alineada con el
+    // veredicto, así que el OR es retrocompatible.
+    $cuota     = ($veredicto === 'CUOTA') || !empty($data['cuota_agotada']);
 
     // v18+: el workdir queda intacto en su path local. El caller decide post-QA
     // si llamarlo agyBorrarWorkdir($workdir) o agyArchivarWorkdir($workdir, ...).
@@ -1034,6 +1042,27 @@ function _agyShapeRespuesta(
     $extras['paste_reintentos']     = isset($data['paste_reintentos']) ? (int) $data['paste_reintentos'] : 0;
     $extras['clipboard_restaurado'] = !empty($data['clipboard_restaurado']);
     $extras['media_en_log']         = isset($data['media_en_log']) ? (int) $data['media_en_log'] : null;
+    // RESCATE DE TEXTO (core v37, proyecto `agy_texto_descartado`).
+    //   rescate_motivo != '' ⇒ el texto que viene en `response` NO salió por el
+    //     camino normal: entró por uno que hasta v36 lo descartaba (429 posterior
+    //     a la generación, timeout con el texto sólo en la .db, excepción de
+    //     fase), o trae una propiedad que un humano tiene que confirmar
+    //     (`parcial_sin_fin`, `thinking_mezclado`). Se combinan con `+`.
+    //     El worker lo convierte en el QA grave `texto_rescatado` ⇒ la página va
+    //     a revisión y el bundle forense se archiva en vez de borrarse.
+    //   db_identidad_ok tri-estado: ¿la .db de conversación era de ESTA corrida?
+    //     (cascade_id == uuid del `--log-file`). Con != true el `.py` no
+    //     persiste texto NI propaga imagen_cargada/websearch/citations: viajan
+    //     en neutro. Forense — el worker no decide nada con esto hoy.
+    //   db_rechazo: por qué NO se aceptó el candidato de la .db ('' si se aceptó).
+    // Core viejo (v≤36) no manda las claves → ''/null → no-op.
+    // Ver notas/motor_agy.md §"Bump v37".
+    $extras['rescate_motivo']   = isset($data['rescate_motivo']) ? (string) $data['rescate_motivo'] : '';
+    $extras['db_identidad_ok']  = array_key_exists('db_identidad_ok', $data)
+        ? $data['db_identidad_ok']
+        : null;
+    $extras['db_rechazo']       = isset($data['db_rechazo']) ? (string) $data['db_rechazo'] : '';
+    $extras['db_marcas_pagina'] = isset($data['db_marcas_pagina']) ? (int) $data['db_marcas_pagina'] : 0;
 
     // Token usage del statusLine side-channel (leído por el .py tras cerrar agy).
     // Si el setup manual del statusLine no se hizo, todos quedan en 0. A
