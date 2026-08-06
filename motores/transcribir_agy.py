@@ -156,7 +156,7 @@ import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 # Windows: forzar stdout/stderr a utf-8 (mismo gesto que transcribir_aistudio.py)
 try:
@@ -253,22 +253,10 @@ CMD_I_DEFAULT = ("Transcribí la imagen @imagen.jpg siguiendo al pie de la letra
 # mecánica contra agy real: `temp/tests/2026-08-03_170000_agy_tui_paste_media/`
 # (corrida `B_real_file_ctrlv`: media=1, 2,8 MB adjuntos, 26.808 chars).
 PASTE_COLS, PASTE_ROWS = 220, 80        # el TUI pinta cajas: ancho realista, no 2000
-# ── READY y CHIP cierran por SEÑAL, con la quiescencia como fallback (v38) ───
-# Las dos fases esperaban silencio en vez de mirar el hecho observable, y el
-# slot de la cuenta agy está tomado todo ese tramo sin consumir cuota.
-#   · READY: se cierra apenas el TUI pinta su caja de input; si la señal no
-#     aparece (TUI que no arrancó, auth colgada) NO pasa nada raro — cae a la
-#     quiescencia de 5 s de siempre, con el mismo timeout de 150 s.
-#   · CHIP: se cierra apenas el chequeo fáctico del chip se cumple. El chequeo
-#     NO se toca (es la única garantía de que se adjuntó ESTA imagen); lo único
-#     que cambia es CUÁNDO se evalúa.
-# La quiescencia del chip absorbe la espera fija que se eliminó (5,0 + 3,0 = 8,0)
-# para que el veredicto "chip ausente" NUNCA se emita antes que hoy: la ventana
-# de tolerancia del camino de fallo queda igual o mayor, sólo se acorta el
-# camino feliz. Medición del cambio: notas/motor_agy.md §"Bump v38".
-PASTE_READY_QUIESCENT_SEG   = 5.0       # fallback si no aparece la caja de input
+PASTE_READY_QUIESCENT_SEG   = 5.0
 PASTE_READY_TIMEOUT_SEG     = 150.0     # cold start de agy puede ir a ~80 s
-PASTE_CHIP_QUIESCENT_SEG    = 8.0       # = la espera fija de 5,0 + los 3,0 previos
+PASTE_ESPERA_POST_TECLA_SEG = 5.0       # espera fija tras Ctrl+V antes de drenar
+PASTE_CHIP_QUIESCENT_SEG    = 3.0
 PASTE_CHIP_TIMEOUT_SEG      = 25.0
 PASTE_RESP_QUIESCENT_SEG    = 30.0
 PASTE_RESP_GRACIA_SEG       = 5.0       # tras ver FIN, esperar bytes estables
@@ -937,40 +925,6 @@ def _chip_media_presente(snapshot: str) -> bool:
     return False
 
 
-# Regla horizontal con la que el TUI enmarca su caja de input. Se pide larga
-# (≥40) para no confundirla con cualquier guión largo suelto del banner.
-_PASTE_RULER_RE = re.compile(r"─{40,}")
-
-
-def _caja_input_presente(display) -> bool:
-    """¿El TUI ya pintó su caja de input? Es la SEÑAL de fin de la fase READY.
-
-    La caja son tres líneas consecutivas del grid: regla ── / prompt `>` vacío /
-    regla ──. Se exige el prompt EXACTO (`strip() == ">"`): una línea que
-    empiece con `>` pero tenga texto no es la caja recién pintada, y ante la
-    duda conviene caer al fallback por quiescencia (que es el comportamiento
-    histórico) antes que declarar listo un TUI que no lo está.
-
-    Recibe `screen.display` (lista de líneas), no el texto ya unido: se evalúa
-    una vez por chunk durante READY y no hay por qué armar el string entero.
-
-    Medido sobre los 121 bundles paste de `temp/agy_debug/` (replay offline):
-    la caja aparece en 114 y SIEMPRE con el banner de sesión iniciada ya en
-    pantalla (114/114) — o sea que la señal implica "autenticado", que es lo
-    que hace seguro pegar. En los 7 restantes no aparece nunca dentro de la
-    ventana READY (6 corridas donde el TUI no llegó a emitir nada y 1 con la
-    auth colgada en `Signing in...`), así que ahí el fallback por quiescencia
-    reproduce el cierre actual sin cambio alguno. Ver notas/motor_agy.md
-    §"Bump v38".
-    """
-    for i in range(len(display) - 2):
-        if (_PASTE_RULER_RE.search(display[i])
-                and display[i + 1].strip() == ">"
-                and _PASTE_RULER_RE.search(display[i + 2])):
-            return True
-    return False
-
-
 def _texto_corto_paste(sandbox_abs: str) -> str:
     """Mensaje que se TIPEA en el TUI tras adjuntar la imagen. Sin ningún `@`
     (ver el comentario de PASTE_TEXTO_CORTO_TPL)."""
@@ -999,20 +953,17 @@ def capturar_paste(
     `texto_corto` + Enter y espera la respuesta. Devuelve un `CaptureResult`.
 
     Secuencia (calibrada en el test `2026-08-03_170000_agy_tui_paste_media`):
-      1) READY      — cierra por SEÑAL: la caja de input del TUI pintada
-                      (`_caja_input_presente`). Fallback por quiescencia de 5 s
-                      si nunca aparece (timeout 150 s: el cold start va a ~80 s).
+      1) READY      — quiescencia 5 s (timeout 150 s: el cold start va a ~80 s).
       2) CLIPBOARD  — backup del TEXTO previo → file-drop (CF_HDROP) → Ctrl+V
                       INMEDIATO (la ventana en que el portapapeles del usuario
                       está pisado tiene que ser mínima: es un recurso global y
                       NO hay lock — hoy hay 1 solo slot agy por host).
-      3) CHIP       — drenaje 8 s/25 s (`exigir_bytes=False`: el paste puede no
-                      repintar nada) que cierra por SEÑAL apenas la firma del
-                      adjunto está en pantalla. Verificado el chip se RESTAURA
-                      el portapapeles en el acto (no al final del job). Sin
-                      chip: Ctrl+U y un reintento; si vuelve a fallar → estado
-                      PASTE_SIN_CHIP y se cierra agy SIN ENVIAR NADA (cero
-                      cuota → reintentable).
+      3) CHIP       — espera fija 5 s + drenaje 3 s/25 s (`exigir_bytes=False`:
+                      el paste puede no repintar nada) y se busca la firma del
+                      adjunto. Verificado el chip se RESTAURA el portapapeles
+                      en el acto (no al final del job). Sin chip: Ctrl+U y un
+                      reintento; si vuelve a fallar → estado PASTE_SIN_CHIP y
+                      se cierra agy SIN ENVIAR NADA (cero cuota → reintentable).
       4) ENVÍO      — texto corto + 0,8 s + Enter.
       5) RESPUESTA  — marcador FIN + 5 s estables, o quiescencia de 30 s, o
                       `timeout_seg`. Con el detector de loop degenerado (v32)
@@ -1098,25 +1049,13 @@ def capturar_paste(
     def _drenar(quiescent_seg: float, total_timeout: float, label: str,
                 exigir_bytes: bool = True, marcador: Optional[str] = None,
                 gracia: float = PASTE_RESP_GRACIA_SEG,
-                detectar_loop: bool = False,
-                predicado: Optional[Callable[[], bool]] = None,
-                predicado_motivo: str = "PREDICADO") -> tuple:
+                detectar_loop: bool = False) -> tuple:
         """Drena hasta quiescencia (o marcador + gracia, o timeout).
 
         Devuelve (ok, motivo) con motivo ∈ {QUIESCENT, MARCADOR, TIMEOUT,
-        PROC_EXIT, READER_EXC, LOOP} + el `predicado_motivo` que pase el caller.
-        `exigir_bytes=False` permite cerrar por quiescencia aunque no haya
-        llegado un solo byte nuevo — necesario tras el paste, porque el TUI
-        puede no repintar nada al adjuntar.
-
-        `predicado` (bump v38) es el cierre POR SEÑAL de READY y del chip: se
-        evalúa sobre la pantalla `plain` después de cada chunk alimentado y, si
-        da True, corta ahí mismo. Sólo después de un `feed`: la pantalla no
-        puede cambiar sin bytes nuevos, así que un tick vacío no tendría nada
-        que mirar; y como el loop itera con `q.get(timeout=0.2)`, la señal se ve
-        como mucho ~0,2 s después de que el TUI la pintó. Con `predicado=None`
-        (la fase de RESPUESTA) el costo es exactamente cero — ahí el chequeo
-        caro sigue siendo el del marcador, con su gate del v35.
+        PROC_EXIT, READER_EXC, LOOP}. `exigir_bytes=False` permite cerrar por
+        quiescencia aunque no haya llegado un solo byte nuevo — necesario tras
+        el paste, porque el TUI puede no repintar nada al adjuntar.
         """
         nonlocal total_bytes
         local_t0 = time.monotonic()
@@ -1194,13 +1133,6 @@ def capturar_paste(
                                        or marcador in _history_text(hist)):
                         marcador_at = now
                         _log(f"{label}: marcador visto a t={int(now-local_t0)}s")
-                # Cierre por SEÑAL (v38). Va DESPUÉS del feed y sólo acá: la
-                # pantalla no cambia sin bytes nuevos. El `return` es inmediato
-                # — no se espera gracia ni quiescencia, que es justo el punto.
-                if predicado is not None and predicado():
-                    _log(f"{label}: {predicado_motivo} t={int(now-local_t0)}s "
-                         f"bytes_nuevos={total_bytes-bytes_at_entry}")
-                    return True, predicado_motivo
             except queue.Empty:
                 pass
 
@@ -1292,13 +1224,8 @@ def capturar_paste(
     motivo_resp = None
     try:
         # ── FASE 1: TUI listo ──────────────────────────────────────────────
-        # v38: cierra apenas el TUI pinta su caja de input. La quiescencia de
-        # 5 s queda de fallback (mismo timeout de 150 s) para el TUI que nunca
-        # llega a pintarla — ahí el comportamiento es idéntico al histórico.
         ok_ready, motivo_ready = _drenar(
-            PASTE_READY_QUIESCENT_SEG, PASTE_READY_TIMEOUT_SEG, "READY",
-            predicado=lambda: _caja_input_presente(plain.display),
-            predicado_motivo="TUI_LISTO")
+            PASTE_READY_QUIESCENT_SEG, PASTE_READY_TIMEOUT_SEG, "READY")
         res.notas.append(f"ready:{motivo_ready}")
         snap_pre = _screen_text(plain)
         _dump("snapshot_pre_paste.txt", snap_pre)
@@ -1329,17 +1256,9 @@ def capturar_paste(
                     time.sleep(0.5)
                 if not _pegar_imagen():
                     continue
-                # v38: se sigue apenas el chip está FÁCTICAMENTE en pantalla, en
-                # vez de dormir 5 s fijos y esperar otros 3 de silencio. El
-                # predicado es `_chip_media_presente` TAL CUAL — el mismo que
-                # decide abajo si se envía o no; acá sólo se adelanta el momento
-                # de evaluarlo. Si nunca se cumple, la quiescencia (8 s = los
-                # 5 fijos + los 3 de antes) cierra y el veredicto "chip ausente"
-                # se emite no antes que hoy.
+                time.sleep(PASTE_ESPERA_POST_TECLA_SEG)
                 _drenar(PASTE_CHIP_QUIESCENT_SEG, PASTE_CHIP_TIMEOUT_SEG,
-                        "PASTE", exigir_bytes=False,
-                        predicado=lambda: _chip_media_presente(_screen_text(plain)),
-                        predicado_motivo="CHIP")
+                        "PASTE", exigir_bytes=False)
                 snap_post = _screen_text(plain)
                 # El reintento va a un archivo aparte: si se pisara, el bundle
                 # perdería la evidencia de POR QUÉ falló el primer paste.
