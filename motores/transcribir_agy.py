@@ -1681,14 +1681,22 @@ def _extraer_transcripcion_db(db_path: Optional[str]) -> dict:
         if i == -1:
             continue
         j = txt.find(FIN_MARKER, i + len(INI_MARKER))
-        if j != -1:
+        k = txt.find(INI_MARKER, i + len(INI_MARKER))
+        # Un FIN que tiene OTRA apertura por delante no cierra ESTE bloque: es el
+        # cierre citado por la cola de razonamiento ("My output has to start with
+        # `<<<INICIO_TRANSCRIPCION>>>` and end with `<<<FIN_TRANSCRIPCION>>>`").
+        # Sin esta condición el bloque se declaraba `db` (completo) aunque la
+        # transcripción hubiera quedado truncada sin su propio FIN → `sin_fin`
+        # falso, QA de truncado nunca disparaba, y PHP recortaba entre las dos
+        # citas dejando 16 bytes (job 71363, edi 5818 p3 — 2026-08-06).
+        if j != -1 and (k == -1 or k > j):
             seg    = txt[i: j + len(FIN_MARKER)]
             fuente = "db"
         else:
             # Parcial: cortar en el SEGUNDO INICIO si lo hay. El payload trae el
             # texto dos veces (medido en v34), así que sin este corte el rescate
-            # de un truncado devolvería el arranque duplicado.
-            k   = txt.find(INI_MARKER, i + len(INI_MARKER))
+            # de un truncado devolvería el arranque duplicado. Mismo corte cuando
+            # el FIN pertenece al bloque siguiente (condición de arriba).
             seg = txt[i: k] if k != -1 else txt[i:]
             fuente = "db_parcial"
         seg = seg.strip()
