@@ -714,9 +714,6 @@ function chequearUsageAgy(
         $cmd[] = '--home-dir';
         $cmd[] = $homeDir;
     }
-    if ($debugCaptureOk) {
-        $cmd[] = '--debug-capture-ok';
-    }
 
     $stdoutFile = $workdir . DIRECTORY_SEPARATOR . 'stdout.log';
     $stderrFile = $workdir . DIRECTORY_SEPARATOR . 'stderr.log';
