@@ -276,6 +276,7 @@ PASTE_PS_TIMEOUT_SEG        = 60        # timeout de cada invocación del .ps1
 PASTE_PRESUPUESTO_EXTRA_SEG = 90
 PASTE_RESERVA_CIERRE_SEG    = 20
 PASTE_RESP_TIMEOUT_MIN_SEG  = 30        # piso: nunca dejar la respuesta sin margen
+PASTE_GATE_COLA_CHARS       = 256       # ventana deslizante del gate del marcador
 PASTE_KEY_CTRL_V = "\x16"               # pegar
 PASTE_KEY_CTRL_U = "\x15"               # limpiar la línea antes de reintentar
 # Script de portapapeles: vive AL LADO de este .py (viaja con el vendor).
@@ -1032,6 +1033,43 @@ def capturar_paste(
         last_tick = local_t0
         bytes_at_entry = total_bytes
         marcador_at = None
+        # ── Gate barato del chequeo de marcador (bump v35) ───────────────────
+        # Port del gate que `capturar()` ya tiene (`if fin_marker[-6:] in chunk
+        # or candidato_at is not None`). Sin él, en modo paste el chequeo caro
+        # (`_screen_text` + `_history_text`) corre en CADA chunk de 4 KB, y
+        # `_history_text` recorre el historial entero celda por celda en Python
+        # puro: con `history=8000` su costo por llamada crece de ~24 ms a
+        # ~460 ms a medida que satura. Como el TUI repinta el mensaje mientras
+        # crece, el stream se amplifica 31-85× contra 1,02× de `-p` ⇒ cientos de
+        # chunks × cientos de ms = decenas de segundos de CPU pura por página.
+        #
+        # El gate busca el marcador COMPLETO en el chunk con los escapes ANSI
+        # removidos (`_ANSI_RE.sub`, NO `strip_ansi()`: ése además se queda con
+        # lo que sigue al último `\r` de cada línea y podría COMER el marcador).
+        #
+        # Dos decisiones que parecen detalles y no lo son, ambas medidas sobre
+        # los 54 bundles paste de la sesión 419 (55,7 MB de `console_raw`):
+        #
+        #  1. NO usar `marcador[-6:]` como hace `capturar()`. En `-p` da igual,
+        #     pero acá "ION>>>" es también el sufijo de
+        #     `<<<INICIO_TRANSCRIPCION>>>` ⇒ el gate abriría en el chunk ~30 de
+        #     ~350 y el ahorro caería al 2% (11.657 llamadas contra 77).
+        #  2. Des-ANSI-ar antes de buscar. El TUI parte el marcador con un
+        #     escape en medio (visto: `<<<FIN_TRANSCRIPCIO` + `ESC[4h` +
+        #     `N>>>`); pyte lo re-arma pero un `in` sobre el crudo no. Con el
+        #     crudo, 1 de 54 bundles detectaba 3 chunks tarde; des-ANSI-ado,
+        #     54/54 detectan en el MISMO chunk que sin gate.
+        #
+        # `gate_cola` arrastra los últimos chars del chunk anterior para no
+        # perder un marcador partido entre dos lecturas de `read_size`; se usan
+        # 256 (no len(marcador)-1) porque tras quitar los escapes la ventana
+        # útil se achica. `gate_visto` es sticky (equivalente al
+        # `or candidato_at is not None` de `capturar()`). El chequeo caro queda
+        # IDÉNTICO — el gate sólo saltea llamadas donde el marcador no puede
+        # estar. Costo del gate: 0,69 s de regex sobre los 55,7 MB.
+        gate_token = marcador or ""
+        gate_cola = ""
+        gate_visto = False
         while True:
             now = time.monotonic()
             if now - local_t0 >= total_timeout:
@@ -1053,8 +1091,16 @@ def capturar_paste(
                 plain_stream.feed(item)
                 hist_stream.feed(item)
                 if marcador and marcador_at is None:
-                    if (marcador in _screen_text(plain)
-                            or marcador in _history_text(hist)):
+                    if not gate_visto:
+                        if gate_token in _ANSI_RE.sub("", gate_cola + item):
+                            gate_visto = True
+                        # La cola se recalcula sobre `cola+item`, no sobre
+                        # `item`: el PTY devuelve "hasta read_size", no
+                        # exactamente read_size, así que con lecturas cortas
+                        # tomar sólo la cola del chunk perdería el arrastre.
+                        gate_cola = (gate_cola + item)[-PASTE_GATE_COLA_CHARS:]
+                    if gate_visto and (marcador in _screen_text(plain)
+                                       or marcador in _history_text(hist)):
                         marcador_at = now
                         _log(f"{label}: marcador visto a t={int(now-local_t0)}s")
             except queue.Empty:
