@@ -616,6 +616,10 @@ class CaptureResult:
     db_candidato: Optional[str] = None   # mejor segmento hallado, PASE O NO las guardas
     db_marcas_pagina: int = 0    # marcas de estructura en líneas no-razonamiento
     db_razonamiento: bool = False  # el segmento trae thinking mezclado (etiqueta QA)
+    # v41 (F3): el candidato de la .db se TRUNCÓ en un 0x1A porque a partir de ahí
+    # todo era cola de thinking. Etiqueta para `rescate_motivo`; el texto que queda
+    # se persiste igual si pasa el gate de marcas.
+    db_corte_0x1a: bool = False
     # ¿La .db elegida es la de ESTA corrida? Tri-estado (True/False/None=no
     # verificable). Gatea el rescate de texto Y las señales derivadas (v37).
     db_identidad_ok: Optional[bool] = None
@@ -805,6 +809,10 @@ def capturar(
                     print(f"  [capturar] t={int(now - t0)}s bytes={total_bytes} "
                           f"candidato={cand} alive={proc.isalive()}",
                           file=sys.stderr, flush=True)
+
+                # High-water del statusLine (F7, v41): el archivo es
+                # last-write-wins y su ÚLTIMA versión puede venir en cero.
+                _muestrear_token_usage(cwd)
 
                 # ── Corte temprano por LOOP degenerado (bump v31) ────────────
                 # Mismo tick que el progreso: una sola pasada cada
@@ -1148,6 +1156,9 @@ def capturar_paste(
                 last_tick = now
                 _log(f"{label}: t={int(now-local_t0)}s bytes_nuevos={nuevos} "
                      f"alive={proc.isalive()}")
+                # High-water del statusLine (F7, v41): el archivo es
+                # last-write-wins y su ÚLTIMA versión puede venir en cero.
+                _muestrear_token_usage(cwd)
                 # ── Corte temprano por LOOP degenerado (bump v31/v32) ────────
                 # Mismo gate que `capturar()`: si YA vimos el marcador, el
                 # cierre por MARCADOR gana en ≤ gracia y no hay nada que
@@ -1650,13 +1661,15 @@ def _extraer_transcripcion_db(db_path: Optional[str]) -> dict:
       - `marcas`    : marcas de página del segmento elegido (ver
                       `_marcas_pagina_en_segmento`).
       - `step_idx`  : índice del step del que salió.
+      - `corte_0x1a`: el candidato se TRUNCÓ en un 0x1A (cola de thinking, v41).
 
     OJO: la identidad de la .db NO se chequea acá (este helper no conoce el
     logfile). La gatea el caller con `_db_es_de_esta_corrida` — sin eso, esto
     devuelve felizmente la transcripción de otra página.
     """
     out = {"texto": None, "fuente": "", "candidato": None, "rechazo": "",
-           "marcas": 0, "step_idx": None, "razonamiento": False}
+           "marcas": 0, "step_idx": None, "razonamiento": False,
+           "corte_0x1a": False}
     rows = _leer_una_columna_db(
         db_path,
         "SELECT idx, step_payload FROM steps WHERE step_type = 15 ORDER BY idx")
@@ -1699,16 +1712,48 @@ def _extraer_transcripcion_db(db_path: Optional[str]) -> dict:
             # el FIN pertenece al bloque siguiente (condición de arriba).
             seg = txt[i: k] if k != -1 else txt[i:]
             fuente = "db_parcial"
+
+        # ── Corte por 0x1A: cola de thinking pegada a la transcripción (v41) ──
+        # INVARIANTE: esto corre SOBRE EL CANDIDATO ya recortado (regla `k`),
+        # NUNCA sobre `txt` (el `step_payload` crudo), donde el 0x1A es el header
+        # de campo de protobuf y aparece en cualquier corrida — validado 2026-08-07
+        # sobre 8 `api_calls` + 2.668 bundles, 0 contraejemplos.
+        #
+        #   - Sin 0x1A en el candidato → comportamiento histórico, sin cambios.
+        #   - `FIN` ANTES del primer 0x1A → el 0x1A quedó fuera del segmento útil
+        #     y no aporta información: se extrae como siempre. (No implica que la
+        #     corrida sea sana: un par que es puro razonamiento igual cae al gate
+        #     de marcas de abajo.)
+        #   - Primer 0x1A SIN `FIN` previo dentro del candidato → todo lo que sigue
+        #     es razonamiento (un `FIN` posterior al 0x1A y sin re-apertura `INICIO`
+        #     en el medio está CITADO dentro del thinking; con re-apertura, la
+        #     regla `k` ya lo dejó afuera). Se trunca en el 0x1A y el parcial sigue
+        #     el pipeline normal.
+        #
+        # LOSSY POR DISEÑO: la cola descartada puede citar mucha página (peor caso
+        # medido, job63534: 21 marcas antes del 0x1A contra 331 después, todas de
+        # thinking narrando la transcripción). Por eso las marcas POSTERIORES al
+        # 0x1A NO se usan como criterio de nada: mienten.
+        corte_0x1a = False
+        pos_sub = seg.find("\x1a")
+        if pos_sub != -1:
+            pos_fin = seg.find(FIN_MARKER)
+            if pos_fin == -1 or pos_fin > pos_sub:
+                seg        = seg[:pos_sub]
+                fuente     = "db_parcial"
+                corte_0x1a = True
+
         seg = seg.strip()
         if len(seg) < MIN_CONTENT_LEN:
             continue
         marcas = _marcas_pagina_en_segmento(seg)
         if mejor_candidato is None or len(seg) > mejor_candidato[0]:
-            mejor_candidato = (len(seg), seg, idx, fuente, marcas)
+            mejor_candidato = (len(seg), seg, idx, fuente, marcas, corte_0x1a)
         if marcas >= 1:
             out.update({"texto": seg, "fuente": fuente, "candidato": seg,
                         "rechazo": "", "marcas": marcas, "step_idx": int(idx),
-                        "razonamiento": _hay_razonamiento_en_segmento(seg)})
+                        "razonamiento": _hay_razonamiento_en_segmento(seg),
+                        "corte_0x1a": corte_0x1a})
             return out
 
     if mejor_candidato is None:
@@ -1716,10 +1761,15 @@ def _extraer_transcripcion_db(db_path: Optional[str]) -> dict:
         return out
     # Hubo segmento pero sin una sola marca de página: es razonamiento del modelo
     # citando los marcadores. Viaja al raw, no a `entradas`.
+    # Si el candidato se truncó en el 0x1A, el rótulo dice la verdad: lo que
+    # quedó antes de la cola de thinking no tenía página. `sin_contenido_de_pagina`
+    # a secas sugeriría que el modelo no transcribió nada, y no es lo que pasó.
     out.update({"candidato": mejor_candidato[1], "marcas": mejor_candidato[4],
                 "step_idx": int(mejor_candidato[2]),
                 "razonamiento": _hay_razonamiento_en_segmento(mejor_candidato[1]),
-                "rechazo": "sin_contenido_de_pagina"})
+                "corte_0x1a": bool(mejor_candidato[5]),
+                "rechazo": ("thinking_sin_contenido" if mejor_candidato[5]
+                            else "sin_contenido_de_pagina")})
     return out
 
 
@@ -1750,7 +1800,8 @@ def resolver_texto_db(db_path: Optional[str],
     except Exception as e:
         sys.stderr.write(f"[agy] WARN _extraer_transcripcion_db: {type(e).__name__}: {e}\n")
         out = {"texto": None, "fuente": "", "candidato": None,
-               "rechazo": "extractor_excepcion", "marcas": 0, "step_idx": None}
+               "rechazo": "extractor_excepcion", "marcas": 0, "step_idx": None,
+               "razonamiento": False, "corte_0x1a": False}
     identidad = _db_es_de_esta_corrida(db_path, uuid_log)
     out["identidad"] = identidad
     if out.get("texto"):
@@ -2260,6 +2311,10 @@ def main_usage(args, t0_total: float) -> int:
     # la próxima transcripción seguirá su pipeline y lo limpiará.
 
     argv_usage = [args.agy_bin]  # SIN args = abre TUI (con autenticación normal)
+    # Snapshot de `agy*` PREVIO al lanzamiento. Hasta v40 el barrido de abajo
+    # recibía `_pids_agy_actuales()` tomado DESPUÉS de la corrida: todos los pids
+    # del run estaban en `pids_previos` y el barrido era un no-op silencioso.
+    pids_prev_usage = _pids_agy_actuales()
     cap = capturar_slash_command(
         argv_usage,
         slash_cmd="/usage",
@@ -2277,13 +2332,21 @@ def main_usage(args, t0_total: float) -> int:
     # turno). Por las dudas barrer su árbol — agy interactivo a veces deja un
     # language server detached.
     if cap.get("pid"):
+        _arbol_usage = []
+        try:
+            _arbol_usage = _capturar_arbol(cap["pid"])
+        except Exception as _e:
+            sys.stderr.write(f"[agy-usage] WARN _capturar_arbol: {_e}\n")
         try:
             _kill_arbol(cap["pid"])
         except Exception as _e:
             sys.stderr.write(f"[agy-usage] WARN _kill_arbol: {_e}\n")
-        time.sleep(0.3)
         try:
-            _barrido_zombis(_pids_agy_actuales(), t0_total)
+            _esperar_muerte_arbol(_arbol_usage)
+        except Exception as _e:
+            sys.stderr.write(f"[agy-usage] WARN _esperar_muerte_arbol: {_e}\n")
+        try:
+            _barrido_zombis(pids_prev_usage, t0_total, arbol=_arbol_usage)
         except Exception as _e:
             sys.stderr.write(f"[agy-usage] WARN _barrido_zombis: {_e}\n")
 
@@ -2590,10 +2653,124 @@ def _kill_arbol(pid: int) -> None:
         pass
 
 
-def _barrido_zombis(pids_previos: set, t_start_epoch: float) -> int:
-    """Mata procesos `agy*` creados durante el run (LS detached del padre)."""
+# ── Muerte VERIFICADA del árbol (F6, core v41) ───────────────────────────────
+# Hasta v40 el cierre era `_kill_arbol(pid)` + `time.sleep(1.5)` a ojo. 1,5 s no
+# es una garantía: si el árbol sobrevive, el `.py` retorna con procesos `agy*`
+# vivos y el worker libera su slot con el motor todavía ocupado — que es
+# exactamente el solapamiento que el lock de motor de PHP (F5) tiene que evitar.
+# Con la espera activa de abajo, en el camino normal el `.py` sólo retorna con el
+# árbol muerto y la liberación del lock en PHP es inmediata.
+_ARBOL_ESPERA_TIMEOUT_SEG = 10.0
+_ARBOL_ESPERA_POLL_SEG    = 0.2
+
+
+def _capturar_arbol(pid: int) -> list:
+    """Snapshot del árbol de `pid` ANTES de matarlo: [(pid, create_time, nombre)].
+
+    Incluye al padre. Va ANTES del kill porque sobre un padre ya muerto
+    `children(recursive=True)` es imposible (`NoSuchProcess`) — ahí el árbol
+    conocido queda vacío y el barrido cae a su comportamiento histórico.
+    `create_time` viaja para poder distinguir "el PID sigue vivo" de "el SO
+    recicló el PID" (Windows los reusa rápido).
+    """
+    arbol = []
+    try:
+        padre = psutil.Process(pid)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return arbol
+    procs = [padre]
+    try:
+        procs.extend(padre.children(recursive=True))
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+    for p in procs:
+        try:
+            arbol.append((p.pid, p.create_time(), (p.name() or "").lower()))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return arbol
+
+
+def _proc_es_el_mismo(pid: int, create_time: Optional[float], nombre: str) -> bool:
+    """¿El PID sigue vivo Y es el MISMO proceso que capturamos?
+
+    Identidad por `create_time` (exacta); si no se puede leer, se cae al nombre.
+    Un PID reciclado por el SO responde False y no se cuenta como sobreviviente
+    (ni se mata: sería matar a un tercero inocente).
+    """
+    if not psutil.pid_exists(pid):
+        return False
+    try:
+        p = psutil.Process(pid)
+        if create_time is not None:
+            return abs(p.create_time() - create_time) < 0.5
+        return (p.name() or "").lower() == nombre
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
+def _esperar_muerte_arbol(arbol: list,
+                          notas: Optional[list] = None,
+                          timeout_seg: float = _ARBOL_ESPERA_TIMEOUT_SEG,
+                          poll_seg: float = _ARBOL_ESPERA_POLL_SEG) -> int:
+    """Espera activa hasta que TODO el árbol capturado esté muerto.
+
+    Devuelve la cantidad de sobrevivientes al expirar el timeout (0 = cierre
+    limpio). Al expirar, mata directo a los que queden y deja nota en `notas`
+    (que es `res.notas` en el camino de transcripción).
+    """
+    if not arbol:
+        # No hubo snapshot (padre ya muerto al capturar, o psutil no lo dejó
+        # leer). No hay nada que verificar; se conserva un settle mínimo para que
+        # el barrido de abajo vea el estado ya estabilizado, como hacía el
+        # `sleep(1.5)` de v40.
+        time.sleep(0.3)
+        return 0
+    t0 = time.monotonic()
+    sobrevivientes = []
+    while True:
+        sobrevivientes = [e for e in arbol if _proc_es_el_mismo(*e)]
+        if not sobrevivientes:
+            return 0
+        if (time.monotonic() - t0) >= timeout_seg:
+            break
+        time.sleep(poll_seg)
+    for pid, _ct, nm in sobrevivientes:
+        try:
+            psutil.Process(pid).kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except Exception:
+            continue
+    msg = (f"cierre_arbol:timeout({int(timeout_seg)}s) "
+           f"sobrevivientes={len(sobrevivientes)} "
+           f"pids={[p for p, _c, _n in sobrevivientes][:8]}")
+    sys.stderr.write(f"[agy] WARN {msg}\n")
+    if notas is not None:
+        notas.append(msg)
+    return len(sobrevivientes)
+
+
+def _barrido_zombis(pids_previos: set, t_start_epoch: float,
+                    arbol: Optional[list] = None) -> int:
+    """Mata procesos `agy*` creados durante el run (LS detached del padre).
+
+    v41 (F6): pasa a ser un BACKSTOP con filtro de PERTENENCIA. Los filtros
+    históricos (prefijo `agy`, no estaba en `pids_previos`, `create_time` dentro
+    de la ventana del run) alcanzan para matar al vecino de otro proyecto si
+    alguna vez corren dos motores en el mismo host — que es justo el escenario
+    que el lock de motor de PHP (F5) puede dejar pasar cuando degrada a no-op.
+    Con `arbol` no-vacío, además exigimos que el proceso sea del árbol capturado,
+    o hijo de alguien del árbol, o huérfano plausible (su ppid ya no existe /
+    no es legible: el caso del language server detached, que es el motivo por el
+    que este barrido existe).
+
+    `arbol=None` conserva el comportamiento histórico (sin filtro de
+    pertenencia): degradación segura si el snapshot del árbol no se pudo tomar.
+    """
     barridos = 0
     cutoff = t_start_epoch - 5
+    pids_arbol = {p for p, _ct, _nm in (arbol or [])}
     for p in psutil.process_iter(["name", "create_time"]):
         try:
             nm = (p.info["name"] or "").lower()
@@ -2603,11 +2780,28 @@ def _barrido_zombis(pids_previos: set, t_start_epoch: float) -> int:
                 continue
             if p.info["create_time"] < cutoff:
                 continue
+            if pids_arbol and not _pertenece_al_arbol(p, pids_arbol):
+                continue
             p.kill()
             barridos += 1
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return barridos
+
+
+def _pertenece_al_arbol(p: "psutil.Process", pids_arbol: set) -> bool:
+    """¿`p` es del árbol capturado, hijo de alguien del árbol, o huérfano?"""
+    if p.pid in pids_arbol:
+        return True
+    try:
+        ppid = p.ppid()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return True   # no podemos saberlo: no lo protegemos del backstop
+    if ppid in pids_arbol:
+        return True
+    # Huérfano plausible: el padre ya no existe (taskkill /T se llevó al padre y
+    # dejó al LS detached colgando del PID muerto).
+    return not psutil.pid_exists(ppid)
 
 
 # ============================================================
@@ -3305,7 +3499,75 @@ def _forense_arranque(agy_log_path) -> dict:
 # Como cwd de agy = --sandbox-dir, cada slot tiene su propio archivo: cero race.
 # Doc: https://www.antigravity.google/docs/cli-statusline
 
-def leer_token_usage(sandbox_dir: Path) -> dict:
+# ── High-water del statusLine (F7, core v41) ────────────────────────────────
+# `.agy_last_status.json` es un snapshot LAST-WRITE-WINS: agy lo reescribe entero
+# en cada cambio de agent state, y la última escritura antes de que matemos el
+# árbol puede ser un estado con `context_window.current_usage: null` y
+# `total_input_tokens/total_output_tokens` en 0 (lo tiene el archivo vivo de este
+# host tal cual). Resultado: corridas con generación REAL reportando 0 tokens.
+# Medido 2026-08-07 sobre los 400 bundles más recientes: 57/282 TRANSITORIO y
+# 7/102 **OK** con `current_usage` en 0, y 27/400 con `tokens_total` en 0 —
+# incluidos casos con `statusline_disponible=true`. No es un problema de
+# propagación: `shape_salida` ya manda los tokens en TODOS los veredictos (hay
+# `db_sin_texto_paste_postgen` con 5.244/31.062/66.428). El dato se pierde antes.
+#
+# Fix: muestrear el archivo durante la corrida (en el tick de progreso que ya
+# existe, mismo perfil de costo que el detector de loop) y quedarse con el MÁXIMO
+# por campo. Los contadores del statusLine crecen dentro del turno, así que el
+# máximo es la mejor estimación disponible y NUNCA es peor que el último valor.
+# Sólo se aplica a los contadores de tokens y al tamaño/uso de la ventana: los
+# campos de CUOTA se dejan como venga la lectura final, porque ahí un valor viejo
+# SUBESTIMA el consumo y el feed del worker escribe cuota en la BD.
+_TOKENS_HW = {}
+
+
+def _reset_token_usage_hw() -> None:
+    """Reinicia el high-water (una corrida = un proceso; esto es para los tests)."""
+    _TOKENS_HW.clear()
+
+
+_TOKENS_HW_CAMPOS = ("tokens_input", "tokens_output", "tokens_cached",
+                     "tokens_thought", "tokens_total", "context_window_size",
+                     "used_percentage")
+
+
+def _muestrear_token_usage(sandbox_dir) -> None:
+    """Best-effort: lee el statusLine y guarda el máximo por campo. Nunca tira."""
+    try:
+        if sandbox_dir is None:
+            return
+        parcial = leer_token_usage(Path(sandbox_dir), _muestreo=True)
+        if not parcial.get("statusline_disponible"):
+            return
+        _TOKENS_HW["statusline_disponible"] = True
+        for k in _TOKENS_HW_CAMPOS:
+            v = parcial.get(k) or 0
+            if v > (_TOKENS_HW.get(k) or 0):
+                _TOKENS_HW[k] = v
+    except Exception:
+        pass
+
+
+def _fusionar_token_usage_hw(out: dict) -> dict:
+    """Levanta cada contador de `out` al máximo observado durante la corrida."""
+    if not _TOKENS_HW:
+        return out
+    for k in _TOKENS_HW_CAMPOS:
+        hw = _TOKENS_HW.get(k) or 0
+        if hw > (out.get(k) or 0):
+            out[k] = hw
+    if _TOKENS_HW.get("statusline_disponible"):
+        out["statusline_disponible"] = True
+    return out
+
+
+def leer_token_usage(sandbox_dir: Path, _muestreo: bool = False) -> dict:
+    """Wrapper del lector crudo: fusiona el high-water salvo que sea un muestreo."""
+    out = _leer_token_usage_raw(sandbox_dir, silencioso=_muestreo)
+    return out if _muestreo else _fusionar_token_usage_hw(out)
+
+
+def _leer_token_usage_raw(sandbox_dir: Path, silencioso: bool = False) -> dict:
     """Lee `<sandbox>/.agy_last_status.json` y mapea token counters.
 
     Degrada limpio (plan #3 §5 fallback):
@@ -3337,15 +3599,19 @@ def leer_token_usage(sandbox_dir: Path) -> dict:
     }
     path = sandbox_dir / ".agy_last_status.json"
     if not path.is_file():
-        sys.stderr.write(
-            "[agy] agy_statusline_no_configurado: "
-            f"{path} no existe (tokens en 0)\n"
-        )
+        if not silencioso:
+            sys.stderr.write(
+                "[agy] agy_statusline_no_configurado: "
+                f"{path} no existe (tokens en 0)\n"
+            )
         return out
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
     except Exception as e:
-        sys.stderr.write(f"[agy] WARN .agy_last_status.json no parseable: {e}\n")
+        # En muestreo esto es esperable: agy puede estar reescribiendo el archivo
+        # justo cuando lo leemos. Se descarta la muestra y listo.
+        if not silencioso:
+            sys.stderr.write(f"[agy] WARN .agy_last_status.json no parseable: {e}\n")
         return out
     if not isinstance(data, dict):
         return out
@@ -3522,6 +3788,13 @@ def _motivo_rescate(camino: str, fuente: str, res: "CaptureResult" = None) -> st
     partes = [p for p in (camino,) if p]
     if fuente == "db_parcial":
         partes.append("parcial_sin_fin")
+    # v41 (F3): el texto se cortó en el 0x1A que separa la transcripción de la
+    # cola de thinking. Lo que se persiste es lo de ANTES del corte; el sufijo
+    # avisa que hubo descarte deliberado (lossy por diseño) y manda la página a
+    # revisión por el mismo circuito que el resto de los rescates.
+    if res is not None and getattr(res, "db_corte_0x1a", False) and \
+            str(fuente).startswith("db"):
+        partes.append("thinking_tail_0x1a")
     if res is not None and getattr(res, "db_razonamiento", False) and \
             str(fuente).startswith("db"):
         partes.append("thinking_mezclado")
@@ -4329,6 +4602,7 @@ def _escribir_salida_temprana(salida_json: Path, payload: dict) -> None:
 def main() -> int:
     args = parse_args()
     t0_total = time.time()
+    _reset_token_usage_hw()
 
     # Branch del --modo=usage: pipeline corto (TUI + /usage + parser). NO
     # comparte path con transcripción (no toca scratch/sandbox/modelo global).
@@ -4577,11 +4851,15 @@ def main() -> int:
             verbose=True, progress_seg=15.0,
         )
 
-    # ── Kill agresivo + barrido del LS detached ──
+    # ── Kill agresivo + muerte VERIFICADA del árbol + barrido del LS detached ──
+    # El snapshot del árbol se toma ANTES del kill (sobre un padre muerto no hay
+    # `children()`). La espera activa reemplaza al `time.sleep(1.5)` de v40: acá
+    # es donde se decide que el `.py` no retorne con `agy*` vivos.
+    _arbol = _capturar_arbol(res.pid) if res.pid else []
     if res.pid:
         _kill_arbol(res.pid)
-    time.sleep(1.5)
-    zombis = _barrido_zombis(pids_prev, t_epoch)
+    _esperar_muerte_arbol(_arbol, notas=res.notas)
+    zombis = _barrido_zombis(pids_prev, t_epoch, arbol=_arbol)
     if zombis:
         time.sleep(0.3)
 
@@ -4718,6 +4996,7 @@ def main() -> int:
     res.db_candidato     = _extr.get("candidato")
     res.db_marcas_pagina = int(_extr.get("marcas") or 0)
     res.db_razonamiento  = bool(_extr.get("razonamiento"))
+    res.db_corte_0x1a    = bool(_extr.get("corte_0x1a"))
     res.db_rechazo       = str(_extr.get("rechazo") or "")
     _txt_db              = _extr.get("texto")
     res.response_db      = _txt_db
@@ -4727,6 +5006,7 @@ def main() -> int:
         f"aceptados (candidato={len(res.db_candidato or '')} ch, "
         f"fuente={res.db_fuente or '-'}, marcas_pagina={res.db_marcas_pagina}, "
         f"step={_extr.get('step_idx')}, rechazo={res.db_rechazo or '-'}, "
+        f"corte_0x1a={res.db_corte_0x1a}, "
         f"identidad={res.db_identidad_ok}, generacion={res.hubo_generacion})\n"
     )
 

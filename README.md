@@ -86,6 +86,11 @@ ejecutarAgy(
 | `rows` | int | no | filas (default 100) |
 | `grace` | float | no | segundos de estabilidad tras candidato (default 5.0) |
 | `agy_bin` | string | no | ejecutable de agy (default `agy` en PATH) |
+| `cmd_i` | string | no | chat-input de `-i`; en modo sin-imagen default-ea a `AGY_CMD_I_SIN_IMAGEN` |
+| `cmd_mode` | string | no | `print` (-p) \| `interactive` (-i) \| `paste` (TUI + imagen por portapapeles). Viaja opaco: lo valida el `choices` del argparse del `.py`, que default-ea a `interactive` si no se pasa |
+| `lock_dir` | string | no | **v41** — directorio del lockfile de motor por host (`<lock_dir>/agy_motor.lock`). Default `%LOCALAPPDATA%` y, si no existe, `sys_get_temp_dir()`. Tiene que quedar **fuera** de los árboles de proyecto: prensa y manuscritos-v3 vendorizan copias separadas del core y necesitan colisionar en el MISMO archivo |
+
+**Lock de motor por host (v41).** `ejecutarAgy()` y `chequearUsageAgy()` serializan el lanzamiento de `agy` en cada host con un lockfile (`flock` `LOCK_EX|LOCK_NB`, poll de 500 ms hasta ~10 s). Es **ortogonal al slot de cola** del proyecto consumidor: prensa libera su slot de BD temprano a propósito, y el motor puede seguir vivo unos segundos más. La liberación espera (hasta ~15 s) a que no quede ningún proceso `agy*` en el host antes de soltar. Degradación: si el lockfile no se puede abrir en ningún path, se loguea WARN y se sigue **sin** lock (disponibilidad sobre estrictez — el core lo comparten dos proyectos). Si el lock está ocupado tras los reintentos, `ejecutarAgy()` devuelve `veredicto='TRANSITORIO'` + `transitorio_motivo='lock_motor_ocupado'` para que el consumidor lo re-encole; nunca bloquea (el caller retendría su slot de cola mientras espera). El lockfile **nunca se borra** y **nunca se le escribe nada** (en Windows `flock` es mandatory y bloquearía lecturas ajenas).
 
 ### Entrada CLI del `.py` (`transcribir_agy.py`)
 

@@ -37,6 +37,13 @@
  *   - agyArchivarWorkdir($wd, $archive)     Mueve workdir conservado a OneDrive (v18+)
  *   - agyLimpiarWorkdirsHuerfanos(...): int GC defensivo — manual; ya no se llama auto
  *   - ejecutarAgy(...): array               Equivalente a ejecutarAiStudio()
+ *   - chequearUsageAgy(...): array          /usage → cuota parseada
+ *
+ * Lock de motor por host (v41): `ejecutarAgy` y `chequearUsageAgy` serializan el
+ * lanzamiento de `agy` en el host con un lockfile (`%LOCALAPPDATA%\agy_motor.lock`
+ * por default, override con `$agyConfig['lock_dir']`). Es ORTOGONAL al slot de
+ * cola de la BD, que se libera temprano a propósito. Ver el bloque
+ * "LOCK DE MOTOR POR HOST" abajo antes de tocarlo.
  *
  * Política de captura y lifecycle (v18+):
  *   - El `.py` escribe SIEMPRE el bundle forense en `<workdir>/debug/`
@@ -92,6 +99,161 @@ if (!function_exists('coreLog')) {
 const AGY_CMD_I_SIN_IMAGEN =
     'Seguí al pie de la letra las instrucciones de @prompt.md y devolvé únicamente '
     . 'lo que ahí se pide. No transcribas ninguna imagen. No uses búsqueda web.';
+
+// =====================================================================
+// LOCK DE MOTOR POR HOST (F5, core v41)
+// =====================================================================
+//
+// PROBLEMA. El slot de cola vive en la BD y se libera TEMPRANO en el camino de
+// éxito (rev. 140 de prensa: el tail de persistencia corre sin slot) para no
+// dejar el motor ocioso. Pero el *motor* no es el slot: cuando el worker suelta
+// el slot, el árbol `agy*` de esa corrida puede seguir vivo unos segundos, y el
+// job siguiente arranca otro `agy` encima. Dos `agy` a la vez en un host se
+// pisan el portapapeles (modo `paste`: recurso GLOBAL sin lock — ver
+// notas/motor_agy.md §Bump v34) y el sandbox del slot.
+//
+// SOLUCIÓN. Un lock de ARCHIVO por host, ortogonal al slot de BD: se toma antes
+// de lanzar el subproceso y se suelta cuando el árbol `agy*` está
+// verificadamente muerto. El archivo vive FUERA de los árboles de proyecto
+// (%LOCALAPPDATA% por default) porque prensa y transcriptor-manuscritos-v3
+// vendorizan copias separadas del core y tienen que colisionar en el MISMO
+// archivo.
+//
+// SALVEDADES MEDIDAS (V2, 2026-08-07, PHP 8.4 / Win 10 — exclusión 1-de-6 y
+// liberación instantánea al morir el dueño). No "simplificar" ninguna:
+//   (a) el handle tiene que sobrevivir toda la sección crítica ⇒ el helper lo
+//       RETORNA y el caller lo retiene hasta su `finally`. Si fuera variable
+//       local del helper, PHP lo cerraría al salir y el lock se soltaría solo.
+//   (b) el lockfile NO SE BORRA JAMÁS, ni al liberar: el delete-pending de
+//       Windows lo deja inadquirible hasta que muera el último dueño.
+//   (c) NO se escribe el PID (ni nada) dentro del lockfile: `flock` en Windows
+//       es MANDATORY y bloquearía la lectura ajena. Si alguna vez se quiere
+//       diagnóstico, va en un archivo aparte (`agy_motor.owner`).
+//   (d) si el path primario no abre → fallback a `sys_get_temp_dir()`; si ese
+//       tampoco → WARN y NO-OP. Compatibilidad sobre estrictez: v3 corre este
+//       mismo core y no puede quedar bloqueado por un lock que no se puede
+//       crear.
+//
+// Todo entra por `$agyConfig['lock_dir']` (opcional). Ningún parámetro nuevo
+// obligatorio: v3 no setea nada y funciona con el default.
+
+/** Sentinela de lock degradado: "no se pudo lockear, seguimos igual". */
+const AGY_LOCK_MOTOR_NOOP = 'agy_lock_motor_noop';
+
+/** Segundos que se espera el lock antes de rendirse (no bloqueante, poll). */
+const AGY_LOCK_MOTOR_ESPERA_SEG = 10.0;
+
+/** Segundos que se espera a que muera todo `agy*` antes de soltar el lock. */
+const AGY_LOCK_MOTOR_DRENAJE_SEG = 15.0;
+
+/** Path del lockfile. `lock_dir` > %LOCALAPPDATA% > temp del sistema. */
+function _agyLockMotorPath(array $agyConfig): string
+{
+    $dir = isset($agyConfig['lock_dir']) && $agyConfig['lock_dir'] !== ''
+         ? (string)$agyConfig['lock_dir']
+         : (string)(getenv('LOCALAPPDATA') ?: sys_get_temp_dir());
+    return rtrim(str_replace(['/', '\\'], DIRECTORY_SEPARATOR, $dir), DIRECTORY_SEPARATOR)
+         . DIRECTORY_SEPARATOR . 'agy_motor.lock';
+}
+
+/**
+ * ¿Queda algún proceso cuyo nombre empiece con `agy` vivo en el host?
+ *
+ * Mismo criterio de prefijo que `_barrido_zombis` del `.py` (`name.lower()
+ * .startswith("agy")`), a propósito: los dos tienen que estar de acuerdo sobre
+ * qué es "el motor". BAJO EL LOCK, cualquier `agy*` vivo es de esta corrida, así
+ * que el criterio host-global es correcto — y NO depende de la invariante
+ * mutable "1 slot agy por host" (`agy_slots_*` son flags operativos).
+ */
+function _agyHayProcesoAgyVivo(): bool
+{
+    if (PHP_OS_FAMILY !== 'Windows') return false;
+    $out = []; $code = 0;
+    @exec('tasklist /FO CSV /NH 2>nul', $out, $code);
+    if ($code !== 0) return false;   // no pudimos mirar ⇒ no colgamos al worker
+    foreach ($out as $linea) {
+        if (!preg_match('/^"([^"]*)"/', (string)$linea, $m)) continue;
+        if (stripos($m[1], 'agy') === 0) return true;
+    }
+    return false;
+}
+
+/**
+ * Toma el lock de motor del host.
+ *
+ * @return resource|string|null  resource = lock tomado (retenerlo hasta el
+ *                               `finally` y pasarlo a _agyLiberarLockMotor);
+ *                               AGY_LOCK_MOTOR_NOOP = degradado, se sigue sin
+ *                               lock; null = OCUPADO tras agotar los reintentos.
+ */
+function _agyTomarLockMotor(array $agyConfig, float $esperaMaxSeg = AGY_LOCK_MOTOR_ESPERA_SEG)
+{
+    $paths    = [_agyLockMotorPath($agyConfig)];
+    $fallback = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR . '/')
+              . DIRECTORY_SEPARATOR . 'agy_motor.lock';
+    if ($fallback !== $paths[0]) $paths[] = $fallback;
+
+    $fh = false; $pathUsado = '';
+    foreach ($paths as $p) {
+        $dir = dirname($p);
+        if (!is_dir($dir)) @mkdir($dir, 0755, true);
+        // 'c': crea si falta, NO trunca, y no exige que el archivo tenga nada
+        // adentro (salvedad (c): el lockfile queda vacío para siempre).
+        $fh = @fopen($p, 'c');
+        if ($fh !== false) { $pathUsado = $p; break; }
+        coreLog('agy', 'WARN', "lock_motor: no pude abrir el lockfile ($p)", ['path' => $p]);
+    }
+    if ($fh === false) {
+        coreLog('agy', 'WARN',
+            'lock_motor: ningún path abrible — sigo SIN lock (no-op). '
+            . 'Riesgo: dos agy concurrentes en el host.', ['paths' => $paths]);
+        return AGY_LOCK_MOTOR_NOOP;
+    }
+
+    $t0 = microtime(true);
+    while (true) {
+        if (@flock($fh, LOCK_EX | LOCK_NB)) {
+            return $fh;
+        }
+        if ((microtime(true) - $t0) >= $esperaMaxSeg) break;
+        usleep(500_000);
+    }
+    @fclose($fh);   // (b) NO se borra el archivo, sólo se cierra ESTE handle.
+    coreLog('agy', 'WARN',
+        "lock_motor: ocupado tras " . round(microtime(true) - $t0, 1) . "s ($pathUsado)",
+        ['path' => $pathUsado]);
+    return null;
+}
+
+/**
+ * Suelta el lock, pero recién cuando el motor está verificadamente libre.
+ *
+ * La espera activa es lo que convierte "el subproceso Python retornó" en "no
+ * queda nada de `agy` corriendo": cubre el camino de timeout + `taskkill` del
+ * wrapper, donde el árbol puede sobrevivir al `proc_close`. Si expira, se
+ * loguea WARN y se suelta IGUAL — colgar al worker sería peor que un
+ * solapamiento.
+ *
+ * @param resource|string|null $fh Lo que devolvió _agyTomarLockMotor.
+ */
+function _agyLiberarLockMotor($fh, float $esperaMaxSeg = AGY_LOCK_MOTOR_DRENAJE_SEG): void
+{
+    if (!is_resource($fh)) return;   // AGY_LOCK_MOTOR_NOOP / null → nada que soltar
+    $t0 = microtime(true);
+    while (_agyHayProcesoAgyVivo()) {
+        if ((microtime(true) - $t0) >= $esperaMaxSeg) {
+            coreLog('agy', 'WARN',
+                "lock_motor: todavía hay procesos agy* tras {$esperaMaxSeg}s — suelto igual",
+                []);
+            break;
+        }
+        usleep(500_000);
+    }
+    @flock($fh, LOCK_UN);
+    @fclose($fh);
+    // (b) El lockfile NO se borra: con delete-pending de Windows quedaría
+    //     inadquirible para el próximo job.
+}
 
 // =====================================================================
 // HELPERS
@@ -389,6 +551,13 @@ function _agyEjecutarUnIntento(
  *                                                              portapapeles, workaround del
  *                                                              bug upstream agy #735 — bump
  *                                                              v34. Default .py: interactive)
+ *                                     'lock_dir'              (opcional, v41: directorio del
+ *                                                              lockfile de motor por host.
+ *                                                              Default %LOCALAPPDATA% y, si no
+ *                                                              existe, el temp del sistema. Tiene
+ *                                                              que quedar FUERA de los árboles de
+ *                                                              proyecto para que prensa y v3
+ *                                                              colisionen en el mismo archivo)
  *
  * NOTA v18+: el workdir efímero NO se borra ni se mueve adentro de esta
  * función. Queda en su path local y se devuelve en `sandbox_path` del shape.
@@ -526,13 +695,32 @@ function ejecutarAgy(
             : "Enviando imagen a agy (Antigravity CLI). Espera ~40–90s mientras agy procesa.",
         ['imagen' => $sinImagen ? '(sin imagen)' : basename($imagenPath), 'modelo' => $modeloAgy ?? '(global)', 'intento' => $intentos]);
 
-    $resp = _agyEjecutarUnIntento(
-        $pythonBin, $scriptPath,
-        $imagenPath, $promptPath, $salidaJsonPath, $sandboxDir,
-        $tResp, $procTimeout,
-        $homeDir, $modeloAgy,
-        $cols, $rows, $grace, $agyBin, $cmdI, $cmdMode
-    );
+    // ── 3.b Lock de motor por host (F5, core v41) ──
+    // Va DESPUÉS de las precondiciones (no tiene sentido retener el motor para
+    // fallar por un sandbox inexistente) y ANTES del lanzamiento. La liberación
+    // vive en el `finally` y espera a que el árbol `agy*` esté muerto — eso es
+    // lo que hace que el próximo job no arranque encima de éste.
+    $lockFh = _agyTomarLockMotor($agyConfig);
+    if ($lockFh === null) {
+        // Ocupado tras agotar los reintentos NB. Esperar bloqueando sería peor:
+        // el worker retiene su slot de BD mientras espera → livelock. Se devuelve
+        // un TRANSITORIO para que la política de reintento del worker lo re-encole.
+        agyBorrarWorkdir($workdir);
+        return _agyShapeError(
+            'lock_motor_ocupado: otro proceso tiene el motor agy de este host',
+            $t0Total, 'TRANSITORIO', 'lock_motor_ocupado');
+    }
+    try {
+        $resp = _agyEjecutarUnIntento(
+            $pythonBin, $scriptPath,
+            $imagenPath, $promptPath, $salidaJsonPath, $sandboxDir,
+            $tResp, $procTimeout,
+            $homeDir, $modeloAgy,
+            $cols, $rows, $grace, $agyBin, $cmdI, $cmdMode
+        );
+    } finally {
+        _agyLiberarLockMotor($lockFh);
+    }
 
     $data      = $resp['data'] ?? [];
     $veredicto = $data['veredicto'] ?? null;
@@ -665,6 +853,10 @@ function _agyCopiarDirRecursivo(string $src, string $dst): bool
  *                            + margen. Default 120.
  * @param ?string $workdirBase Base del workdir efímero del wrapper. Si null,
  *                             cae al sys temp.
+ * @param array   $agyConfig  (v41, opcional) Sólo se lee `lock_dir` — el lock de
+ *                            motor por host, compartido con `ejecutarAgy`. Vacío
+ *                            = default (%LOCALAPPDATA%). Los callers viejos no lo
+ *                            pasan y siguen funcionando.
  *
  * NOTA v18+: el workdir efímero NO se borra ni se mueve adentro. Queda en su
  * path local y el caller decide post-corrida con `agyBorrarWorkdir()` o
@@ -675,7 +867,8 @@ function chequearUsageAgy(
     string  $sandboxDir,
     ?string $homeDir   = null,
     int     $timeoutSeg = 120,
-    ?string $workdirBase = null
+    ?string $workdirBase = null,
+    array   $agyConfig = []
 ): array {
     $t0Total = microtime(true);
 
@@ -748,34 +941,49 @@ function chequearUsageAgy(
     $exitCode = -1;
     $timedOut = false;
 
-    $proc = @proc_open($cmd, $descriptorSpec, $pipes, $workdir, $envFiltrado);
-    if ($proc === false) {
-        return _agyShapeUsageError("proc_open_fallo", $t0Total);
+    // ── Lock de motor por host (F5, core v41) ──
+    // El /usage abre el MISMO binario `agy` que una transcripción y ocupa el
+    // motor igual: sin esto, un check podría arrancar encima de un job en vuelo
+    // (o al revés). Comparte helpers y lockfile con `ejecutarAgy`.
+    $lockFh = _agyTomarLockMotor($agyConfig);
+    if ($lockFh === null) {
+        // El worker re-encola los usage checks con retry corto; que el motivo
+        // sea explícito alcanza para diagnosticarlo en el log.
+        return _agyShapeUsageError(
+            'lock_motor_ocupado: otro proceso tiene el motor agy de este host', $t0Total);
     }
-    if (isset($pipes[0])) fclose($pipes[0]);
+    try {
+        $proc = @proc_open($cmd, $descriptorSpec, $pipes, $workdir, $envFiltrado);
+        if ($proc === false) {
+            return _agyShapeUsageError("proc_open_fallo", $t0Total);
+        }
+        if (isset($pipes[0])) fclose($pipes[0]);
 
-    while (true) {
-        $status = proc_get_status($proc);
-        if (!$status['running']) {
-            $exitCode = $status['exitcode'];
-            break;
-        }
-        if (microtime(true) - $t0 > $procTimeout) {
-            $pid = $status['pid'] ?? 0;
-            if ($pid > 0 && PHP_OS_FAMILY === 'Windows') {
-                @exec("taskkill /F /T /PID {$pid} 2>nul");
+        while (true) {
+            $status = proc_get_status($proc);
+            if (!$status['running']) {
+                $exitCode = $status['exitcode'];
+                break;
             }
-            proc_terminate($proc);
-            for ($i = 0; $i < 30; $i++) {
-                usleep(100_000);
-                if (!proc_get_status($proc)['running']) break;
+            if (microtime(true) - $t0 > $procTimeout) {
+                $pid = $status['pid'] ?? 0;
+                if ($pid > 0 && PHP_OS_FAMILY === 'Windows') {
+                    @exec("taskkill /F /T /PID {$pid} 2>nul");
+                }
+                proc_terminate($proc);
+                for ($i = 0; $i < 30; $i++) {
+                    usleep(100_000);
+                    if (!proc_get_status($proc)['running']) break;
+                }
+                $timedOut = true;
+                break;
             }
-            $timedOut = true;
-            break;
+            usleep(300_000);
         }
-        usleep(300_000);
+        proc_close($proc);
+    } finally {
+        _agyLiberarLockMotor($lockFh);
     }
-    proc_close($proc);
 
     $duracion = microtime(true) - $t0;
     $data = [];
@@ -862,10 +1070,23 @@ function _agyDummyJpgBytes(): string
 
 /**
  * Devuelve el shape de error preflight (sin workdir).
+ *
+ * v41: `$veredicto` y `$transitorioMotivo` son OPCIONALES y sólo los usa el
+ * camino `lock_motor_ocupado` (F5), que no es un fallo del job sino del host:
+ * sale como `veredicto='TRANSITORIO'` + `transitorio_motivo='lock_motor_ocupado'`
+ * para que el worker lo re-encole por el harness que ya existe. Con los defaults
+ * el shape es EXACTAMENTE el histórico (la clave `transitorio_motivo` ni
+ * aparece), así que los 7 callers preflight anteriores no cambian.
  */
-function _agyShapeError(string $errorMsg, float $t0Total): array
+function _agyShapeError(
+    string $errorMsg,
+    float  $t0Total,
+    string $veredicto = 'ERROR_PREFLIGHT',
+    string $transitorioMotivo = ''
+): array
 {
-    return [
+    $extra = $transitorioMotivo !== '' ? ['transitorio_motivo' => $transitorioMotivo] : [];
+    return $extra + [
         'ok' => false,
         'error' => $errorMsg,
         'response' => '',
@@ -881,7 +1102,7 @@ function _agyShapeError(string $errorMsg, float $t0Total): array
         'sandbox_path' => null,
         'cuota_agotada' => false,
         'engine' => 'agy',
-        'veredicto' => 'ERROR_PREFLIGHT',
+        'veredicto' => $veredicto,
     ];
 }
 
