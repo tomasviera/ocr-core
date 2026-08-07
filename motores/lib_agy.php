@@ -378,7 +378,9 @@ function _agyEjecutarUnIntento(
     ?float  $grace,
     ?string $agyBin,
     ?string $cmdI,
-    ?string $cmdMode
+    ?string $cmdMode,
+    ?callable $latido = null,
+    int     $latidoCadaSeg = 30
 ): array {
     $cmd = [
         $pythonBin, '-u', $scriptPath,
@@ -455,6 +457,7 @@ function _agyEjecutarUnIntento(
     $t0 = microtime(true);
     $exitCode = -1;
     $timedOut = false;
+    $tUltimoLatido = $t0;   // primer latido a los $latidoCadaSeg del arranque
 
     $proc = @proc_open($cmd, $descriptorSpec, $pipes, $workdir, $envFiltrado);
     if ($proc === false) {
@@ -487,6 +490,14 @@ function _agyEjecutarUnIntento(
             break;
         }
         usleep(300_000);
+        // Latido opcional del caller (ver docblock de ejecutarAgy). El consumidor
+        // queda BLOQUEADO acá hasta $procTimeout y no puede refrescar sus propias
+        // marcas de vida; sin esto, un supervisor que las vigile lo da por muerto
+        // y re-despacha su trabajo. Best-effort: nunca voltea la transcripción.
+        if ($latido !== null && (microtime(true) - $tUltimoLatido) >= $latidoCadaSeg) {
+            $tUltimoLatido = microtime(true);
+            try { $latido(); } catch (Throwable $eLat) { /* ignorado a propósito */ }
+        }
     }
     proc_close($proc);
 
@@ -558,6 +569,24 @@ function _agyEjecutarUnIntento(
  *                                                              que quedar FUERA de los árboles de
  *                                                              proyecto para que prensa y v3
  *                                                              colisionen en el mismo archivo)
+ *                                     'latido'                (callable|null, v42: callback
+ *                                                              sin argumentos que el loop de
+ *                                                              poll invoca cada
+ *                                                              'latido_cada_seg' mientras el
+ *                                                              subprocess corre. Ver NOTA v42)
+ *                                     'latido_cada_seg'       (int, default 30, mínimo 5)
+ *
+ * NOTA v42 — por qué existe `latido`: el consumidor queda BLOQUEADO adentro de
+ * esta función hasta `timeout_respuesta_seg` (+120 s de margen ConPTY), y en ese
+ * lapso no puede refrescar sus propias marcas de vida. Si algo lo vigila por
+ * timeout —en prensa, el supervisor: `workers_registrados.last_heartbeat` a los
+ * 5 min y `trabajos_api.started_at` a los 30— lo da por muerto y re-despacha su
+ * trabajo, quedando DOS ejecuciones del mismo job. Eso es el incidente #72025 de
+ * prensa (2026-08-07): el segundo intento murió con `imagen_no_existe` porque el
+ * primero ya había borrado la imagen, y su cierre en `error` pisó el `completado`
+ * del primero, que ya había guardado la transcripción. El callback es opcional y
+ * best-effort (una excepción adentro se traga y NO voltea la transcripción), así
+ * que un caller que no lo pase se comporta igual que en v41.
  *
  * NOTA v18+: el workdir efímero NO se borra ni se mueve adentro de esta
  * función. Queda en su path local y se devuelve en `sandbox_path` del shape.
@@ -605,6 +634,12 @@ function ejecutarAgy(
     // interactive (compat: v3 sigue en -i, no setea cmd_mode).
     $cmdMode    = isset($agyConfig['cmd_mode']) && $agyConfig['cmd_mode'] !== ''
                 ? (string)$agyConfig['cmd_mode'] : null;
+    // Latido opcional (ver docblock). Ausente/no-callable = null → el loop de poll
+    // se comporta exactamente como antes: retrocompatible con cualquier caller
+    // que no lo pase (transcriptor-manuscritos-v3 incluido).
+    $latido     = (isset($agyConfig['latido']) && is_callable($agyConfig['latido']))
+                ? $agyConfig['latido'] : null;
+    $latidoCada = max(5, (int)($agyConfig['latido_cada_seg'] ?? 30));
 
     // ── 1. Validar precondiciones ──
     $pythonBin = agyPython();
@@ -716,7 +751,8 @@ function ejecutarAgy(
             $imagenPath, $promptPath, $salidaJsonPath, $sandboxDir,
             $tResp, $procTimeout,
             $homeDir, $modeloAgy,
-            $cols, $rows, $grace, $agyBin, $cmdI, $cmdMode
+            $cols, $rows, $grace, $agyBin, $cmdI, $cmdMode,
+            $latido, $latidoCada
         );
     } finally {
         _agyLiberarLockMotor($lockFh);
