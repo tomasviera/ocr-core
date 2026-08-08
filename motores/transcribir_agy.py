@@ -314,12 +314,26 @@ _RE_FORWARDING_MEDIA = re.compile(
 #
 # Sintaxis: `command(echo)`. La doc de agent-permissions dice "matches commands
 # by exact word/token prefix"; interpretación esperada = prefix (todo command que
-# arranque con `echo` matchea, incluyendo `echo "Starting transcription"`). A
-# validar en próxima investigación de jobs — ver notas/motor_agy.md §Bump v27
-# para el checklist: (a) allow gana sobre el `command(*)` en deny, (b) el patrón
-# realmente cubre `echo <args con espacios/quotes>`, (c) no aparece uso malicioso.
-# Si en (b) resulta que la interpretación es estricta por-token en vez de prefix,
-# habrá que agregar variantes `command(echo .*)`, `command(echo .* .*)`, etc.
+# arranque con `echo` matchea, incluyendo `echo "Starting transcription"`).
+#
+# v43 (2026-08-08) — EL CHECKLIST DEL v27 ESTÁ RESPONDIDO: **este allow NO
+# funciona**. No cambia nada en el comportamiento observado; queda acá sólo para
+# no perder el intento mientras se investiga la causa.
+# Evidencia (prensa, sesión 428, 4 bundles: job72848 / 72852 / 72984 / 72987):
+#   - el `.agents/settings.json` se escribe correcto en el sandbox (verificado
+#     en disco: el allow con `command(echo)` está ahí);
+#   - PERO el set de permisos efectivo que agy embebe en `executor_metadata` de
+#     la conversación es sólo `mcp(chrome_devtools/evaluate_script)`,
+#     `write_file(/)`, `command(*)`, `unsandboxed(*)` — la string `echo` no
+#     aparece en NINGUNA parte de esa tabla;
+#   - los 4 comandos denegados empezaban con `echo` (prefijo, con y sin comillas)
+#     en 3 hosts y 3 cuentas distintas, y el step 9 de cada .db registra
+#     "User denied permission to run command: echo …".
+# Hipótesis abiertas (sin discriminar todavía): (a) el `command(*)` del deny gana
+# sobre cualquier allow, (b) la sintaxis del patrón no es la esperada, (c) agy en
+# `-p` no lee los allow de `.agents/settings.json`. Investigación en curso; hasta
+# que cierre, el freno real es el reintento con cap del v43 (rama A de
+# `shape_salida` + `tool_denegada_headless` en el worker), no este allow.
 SANDBOX_SETTINGS = {
     "permissions": {
         "allow": [
@@ -4170,7 +4184,9 @@ def shape_salida(
     #   A. jetski headless deny  → agy en `-p` auto-deniega una tool (read_file,
     #      command, …) y emite en el response el mensaje literal
     #      "jetski: no output produced — a tool required the \"<tool>\" permission…".
-    #      TERMINAL: no vale reintentar sin cambiar SANDBOX_SETTINGS o el prompt.
+    #      TRANSITORIO desde el v43 (motivo `tool_denegada_headless`, cap 1 en el
+    #      worker): es esporádico, no determinístico por página. Hasta v42 era
+    #      TERMINAL — ver la justificación completa en la rama A más abajo.
     #   B. executor terminated → agy muere pre-arranque con `printmode.go`
     #      "run ended with error and no response: Agent execution terminated
     #      due to error." (response literal 47 chars). Sub-causas del
@@ -4221,12 +4237,44 @@ def shape_salida(
         tool_denegada = m.group(1) if m else "desconocida"
         firma_detectada = "A_jetski"
         ok = False
-        veredicto = "ERROR"
+        # ── v43: TERMINAL → TRANSITORIO. Es el ÚNICO transitorio del motor que
+        # SÍ consumió cuota, y eso es deliberado. Lean esto antes de "arreglarlo":
+        #
+        # El deny NO es determinístico por página: el modelo decide invocar
+        # `run_command` con un `echo` decorativo ("Generating transcription",
+        # "done") de forma esporádica — medido en ~1 % de los jobs, 22 casos en
+        # 30 días sobre 3 hosts y 3 cuentas distintas. La misma página reintentada
+        # normalmente transcribe bien, así que el reintento SÍ cambia el resultado
+        # (que es exactamente lo que el gate del v33 exige para justificar el
+        # gasto; lo que aquel incidente prohibió fue reintentar un fallo
+        # DETERMINÍSTICO, el INVALID_ARGUMENT 400).
+        #
+        # Las dos capas previas están agotadas, no sin probar:
+        #   - el prompt de producción ya dice literal "No uses `run_command`,
+        #     `echo`, ni PowerShell" y el modelo lo lee (consta en el step 4 de
+        #     la .db) y lo invoca igual;
+        #   - el allow `command(echo)` del bump v27 NO llega al set de permisos
+        #     efectivo de agy (verificado en `executor_metadata` de 4 bundles de
+        #     la sesión 428: sólo aparecen los deny, la string `echo` no está).
+        #     Por qué, es investigación abierta.
+        # Y no hay nada que rescatar: en los 4 casos medidos agy murió en el
+        # bloque de thinking, con 0 chars de transcripción en la .db.
+        #
+        # El costo del reintento está acotado del lado del worker, NO acá: el
+        # motivo `tool_denegada_headless` viaja explícito para que prensa le
+        # aplique cap 1 (no el cap 3 de los transitorios sin consumo) y lo
+        # excluya del ledger del breaker por host — un capricho del modelo no es
+        # salud del host. Un core nuevo contra un worker viejo degrada a cap 3,
+        # no a algo roto.
+        veredicto = "TRANSITORIO"
+        firma_transitorio_motivo_forzado = "tool_denegada_headless"
         error = (
             f"jetski_headless_deny: agy en -p auto-denegó la tool '{tool_denegada}' "
-            f"(headless no puede pedir confirmación interactiva). No reintentable "
-            f"sin agregar 'command(...)' u otro allow en SANDBOX_SETTINGS, o reforzar "
-            f"el prompt para que el modelo no invoque esa tool"
+            f"(headless no puede pedir confirmación interactiva) y murió sin emitir "
+            f"transcripción. Esporádico y NO determinístico por página ⇒ "
+            f"reintentable con cap corto, aunque haya consumido cuota. El fix de "
+            f"fondo es que el allow de esa tool llegue al set efectivo de agy "
+            f"(hoy `command(echo)` en SANDBOX_SETTINGS no llega)"
         )
     elif ok and resp_stripped == "Error: Agent execution terminated due to error.":
         # ── B: executor terminated. SE PARTE EN DOS (bump v33, 2026-08-03) ────
@@ -4239,15 +4287,51 @@ def shape_salida(
         # repetía el gasto exacto: 724 jobs × 3 = 2176 corridas idénticas, ~15 h
         # de slot y la cola entera quemada.
         #
-        # El gate ahora se consulta de verdad:
+        # El gate ahora se consulta de verdad (matiz del v43 en el 2º renglón):
         #   - sin `streamGenerateContent`  → TRANSITORIO (comportamiento v25).
-        #   - CON `streamGenerateContent`  → ERROR terminal: hubo consumo, y un
-        #     fallo posterior a la generación no se arregla reintentando.
+        #   - CON `streamGenerateContent`  → ERROR terminal, SALVO que la .db
+        #     nombre una causa raíz clasificada como reintentable (v43): un
+        #     fallo posterior a la generación no se arregla reintentando, pero
+        #     un 401 de auth stale no es "el fallo", es ruido de infraestructura.
         #   - log ilegible (None)          → TRANSITORIO (conservador = status quo).
         _hubo_gen = getattr(res, "hubo_generacion", None)
         _subcausa = (getattr(res, "subcausa_log", "") or "").strip()
         _sub_txt  = f" Sub-causa del log: {_subcausa}." if _subcausa else ""
-        if _hubo_gen:
+        # ── v43: el postgen ya no es terminal A CIEGAS ───────────────────────
+        # La rama de paste (Fix 3 del v37) ya distinguía causa raíz reintentable
+        # de determinística leyendo `_FIRMAS_ERROR_DB` sobre la .db; esta rama
+        # decidía sólo por `hubo_generacion` y nunca consultaba ese diagnóstico.
+        # Consecuencia medida (prensa, sesión 428, job72938): un
+        # `UNAUTHENTICATED (401)` —que la tabla marca `reintentable=True` desde
+        # el v37 y que se despeja solo en la corrida siguiente— murió terminal y
+        # la página se perdió.
+        # Consultar la tabla NO reabre el incidente del v33: el
+        # `invalid_argument_400` que lo causó sigue marcado `reintentable=False`
+        # y cae en el `else` terminal de siempre. Sólo se degrada a TRANSITORIO
+        # lo que está clasificado explícitamente como reintentable; una firma
+        # desconocida (etiqueta "" / `reintentable=None`) también sigue terminal.
+        _diag_b2  = getattr(res, "diag_db", None) or {}
+        _et_b2    = str(_diag_b2.get("etiqueta") or "")
+        _det_b2   = str(_diag_b2.get("detalle") or "")[:200]
+        _det_txt  = f" Detalle de la .db: {_det_b2}" if _det_b2 else ""
+        if _hubo_gen and _diag_b2.get("reintentable") is True:
+            firma_detectada = "B3_executor_terminated_postgen_reintentable"
+            ok = False
+            veredicto = "TRANSITORIO"
+            # Prefijo `postgen_` DELIBERADO: la MISMA etiqueta (p.ej.
+            # `401_unauthenticated`) puede llegar por el camino de paste sin
+            # haber consumido nada, y ahí el cap generoso de 3 es correcto. El
+            # prefijo es lo que le permite al worker cobrarle cap 1 sólo a la
+            # variante que ya gastó cuota, sin castigar a la otra.
+            firma_transitorio_motivo_forzado = f"postgen_{_et_b2}" if _et_b2 else "postgen_reintentable"
+            error = (
+                f"executor_terminated_postgen_reintentable: agy murió con 'Agent "
+                f"execution terminated due to error.' DESPUÉS de generar, pero la "
+                f"causa raíz de la .db es '{_et_b2}', clasificada como reintentable "
+                f"(no determinística: se despeja sola en la corrida siguiente). "
+                f"Reintentable con cap corto pese al consumo.{_sub_txt}{_det_txt}"
+            )
+        elif _hubo_gen:
             firma_detectada = "B2_executor_terminated_postgen"
             ok = False
             veredicto = "ERROR"
@@ -4257,7 +4341,7 @@ def shape_salida(
                 "RECIÉN DESPUÉS murió con 'Agent execution terminated due to "
                 "error.'. NO es un fallo de arranque: reintentar repite el gasto "
                 "sin cambiar el resultado. Terminal — mirar la sub-causa y el "
-                "bundle forense." + _sub_txt
+                "bundle forense." + _sub_txt + _det_txt
             )
         else:
             firma_detectada = "B_executor_terminated"
@@ -5010,28 +5094,39 @@ def main() -> int:
         f"identidad={res.db_identidad_ok}, generacion={res.hubo_generacion})\n"
     )
 
+    # ── Sub-causa de la .db: se puebla en LOS TRES MODOS (v43) ───────────────
+    # Hasta v42 este diagnóstico vivía dentro del `if cmd_mode == "paste"`, así
+    # que en `-p`/`-i` `res.diag_db` quedaba siempre vacío y las firmas del
+    # desambigüe de `shape_salida` (rama B2 = executor_terminated_postgen) no
+    # tenían con qué distinguir un 401 de auth stale —que la tabla
+    # `_FIRMAS_ERROR_DB` marca reintentable— de un INVALID_ARGUMENT 400
+    # determinístico. Medido en prensa (sesión 428, job72938, modo print): el
+    # 401 murió terminal y la página se perdió, pese a que la firma existía en
+    # la .db y ya estaba clasificada como reintentable desde el v37.
+    #
+    # Los dos gates del v37 se conservan intactos:
+    #   - sólo cuando NO hay texto (en el camino feliz sería una consulta
+    #     SQLite de más por job — lección de performance del v35);
+    #   - sólo con identidad probada: el error de OTRA conversación
+    #     etiquetaría mal esta corrida, que es el mismo pecado que el
+    #     texto ajeno. Sin identidad, decide el gate de generación (que
+    #     sale del `--log-file` propio y no de la .db).
+    # ⇒ en el camino feliz de cualquier modo el costo sigue siendo cero.
+    if not _txt_db and res.db_identidad_ok is True:
+        try:
+            res.diag_db = _diagnostico_errores_db(_db_info.get("db_path"))
+        except Exception as _e:
+            res.diag_db = {}
+            sys.stderr.write(f"[agy] WARN _diagnostico_errores_db: {_e}\n")
+        sys.stderr.write(f"[agy] sin texto en la .db → diagnostico: "
+                         f"{(res.diag_db or {}).get('etiqueta') or '(sin firma)'}\n")
+
     if args.cmd_mode == "paste":
         sys.stderr.write(
             f"[agy] paste: chip={getattr(res, 'paste_chip_detectado', False)} "
             f"reintentos={getattr(res, 'paste_reintentos', 0)} "
             f"clipboard_restaurado={getattr(res, 'clipboard_restaurado', False)}\n"
         )
-        if not _txt_db and res.db_identidad_ok is True:
-            # Sub-causa de la .db para el desambigüe del Fix 3 (v37). Dos gates:
-            #   - sólo cuando NO hay texto (en el camino feliz sería una consulta
-            #     SQLite de más por job — lección de performance del v35);
-            #   - sólo con identidad probada: el error de OTRA conversación
-            #     etiquetaría mal esta corrida, que es el mismo pecado que el
-            #     texto ajeno. Sin identidad, decide el gate de generación (que
-            #     sale del `--log-file` propio y no de la .db).
-            try:
-                res.diag_db = _diagnostico_errores_db(_db_info.get("db_path"))
-            except Exception as _e:
-                res.diag_db = {}
-                sys.stderr.write(f"[agy] WARN _diagnostico_errores_db: {_e}\n")
-            sys.stderr.write(f"[agy] paste sin texto → diagnostico .db: "
-                             f"{(res.diag_db or {}).get('etiqueta') or '(sin firma)'}\n")
-
         if (not _txt_db
                 and res.estado != "PASTE_SIN_CHIP"
                 and not getattr(res, "loop_detectado", False)
