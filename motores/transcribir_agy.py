@@ -1018,6 +1018,11 @@ def capturar_paste(
 
     raw_parts: list = []
     total_bytes = 0
+    # `bytes_utiles` excluye el latido de modo del TUI (ver _es_ruido_de_modo);
+    # es el que decide la quiescencia. Sin esto, desde agy 1.1.14 el READY del
+    # paste no cierra nunca y se van los 150 s enteros del timeout en cada job.
+    bytes_utiles = 0
+    ruido_ignorado = 0
     t0 = time.monotonic()
 
     def _log(msg: str) -> None:
@@ -1079,11 +1084,11 @@ def capturar_paste(
         quiescencia aunque no haya llegado un solo byte nuevo — necesario tras
         el paste, porque el TUI puede no repintar nada al adjuntar.
         """
-        nonlocal total_bytes
+        nonlocal total_bytes, bytes_utiles, ruido_ignorado
         local_t0 = time.monotonic()
         last_byte = local_t0
         last_tick = local_t0
-        bytes_at_entry = total_bytes
+        utiles_at_entry = bytes_utiles
         marcador_at = None
         # ── Gate barato del chequeo de marcador (bump v35) ───────────────────
         # Port del gate que `capturar()` ya tiene (`if fin_marker[-6:] in chunk
@@ -1126,7 +1131,8 @@ def capturar_paste(
             now = time.monotonic()
             if now - local_t0 >= total_timeout:
                 _log(f"{label}: TIMEOUT t={int(now-local_t0)}s "
-                     f"bytes_nuevos={total_bytes-bytes_at_entry}")
+                     f"bytes_utiles={bytes_utiles-utiles_at_entry} "
+                     f"ruido_ignorado={ruido_ignorado}")
                 return False, "TIMEOUT"
             try:
                 item = q.get(timeout=0.2)
@@ -1139,9 +1145,13 @@ def capturar_paste(
                     return False, "READER_EXC"
                 raw_parts.append(item)
                 total_bytes += len(item)
-                last_byte = now
                 plain_stream.feed(item)
                 hist_stream.feed(item)
+                if _es_ruido_de_modo(item):
+                    ruido_ignorado += 1
+                else:
+                    bytes_utiles += len(item)
+                    last_byte = now
                 if marcador and marcador_at is None:
                     if not gate_visto:
                         if gate_token in _ANSI_RE.sub("", gate_cola + item):
@@ -1158,18 +1168,19 @@ def capturar_paste(
             except queue.Empty:
                 pass
 
-            nuevos = total_bytes - bytes_at_entry
+            nuevos = bytes_utiles - utiles_at_entry
             if marcador_at is not None and (now - last_byte) >= gracia:
-                _log(f"{label}: MARCADOR + {gracia}s estables (bytes_nuevos={nuevos})")
+                _log(f"{label}: MARCADOR + {gracia}s estables (bytes_utiles={nuevos})")
                 return True, "MARCADOR"
             if (now - last_byte) >= quiescent_seg and (nuevos > 0 or not exigir_bytes):
-                _log(f"{label}: QUIESCENT t={int(now-local_t0)}s bytes_nuevos={nuevos}")
+                _log(f"{label}: QUIESCENT t={int(now-local_t0)}s bytes_utiles={nuevos} "
+                     f"ruido_ignorado={ruido_ignorado}")
                 return True, "QUIESCENT"
 
             if (now - last_tick) >= progress_seg:
                 last_tick = now
-                _log(f"{label}: t={int(now-local_t0)}s bytes_nuevos={nuevos} "
-                     f"alive={proc.isalive()}")
+                _log(f"{label}: t={int(now-local_t0)}s bytes_utiles={nuevos} "
+                     f"ruido_ignorado={ruido_ignorado} alive={proc.isalive()}")
                 # High-water del statusLine (F7, v41): el archivo es
                 # last-write-wins y su ÚLTIMA versión puede venir en cero.
                 _muestrear_token_usage(cwd)
@@ -1985,6 +1996,42 @@ _USAGE_PLAN_RE = re.compile(
     r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\s*\(([^()\n]+)\)")
 
 
+# ── Latido de modo del TUI (agy 1.1.14+) ─────────────────────────────────────
+# Desde agy 1.1.14 (primer forense: 2026-08-18) el TUI re-emite cada ~2 s el
+# enable de bracketed-paste + modifyOtherKeys (ESC[?2004h + ESC[>4;2m) sin
+# repintar una sola celda. Los drenadores de este archivo cierran por
+# quiescencia = "bytes congelados N segundos", así que ese latido resetea el
+# reloj para siempre: `--modo=usage` moría en READY_TIMEOUT con la TUI
+# perfectamente lista en pantalla (58 latidos exactos dentro de los 120 s del
+# timeout; forense en prensa: temp/agy_debug/usage_check_013149000). Antes de
+# 1.1.14 el mismo bundle traía 1 sola emisión y el check cerraba en ~20 s.
+#
+# Estas secuencias son puro set/reset de modos del terminal: no mueven el
+# cursor ni pintan celdas, así que un chunk compuesto SÓLO por ellas no es
+# evidencia de actividad y no debe reiniciar la ventana de quiescencia. El
+# `fullmatch` deja el criterio fail-safe en los dos sentidos: alcanza UN byte
+# útil (o un chunk partido a la mitad de una secuencia) para que el chunk
+# cuente como actividad igual que antes.
+_MODO_NOOP_RE = re.compile(
+    r"(?:"
+    r"\x1b\[\?\d+(?:;\d+)*[hl]"      # DECSET/DECRST: ?2004h/l, ?25h/l, ?1004h…
+    r"|\x1b\[>\d*(?:;\d+)*[mnu]"     # XTMODKEYS / XTQMODKEYS: >4;2m
+    r"|\x1b\[=\d+(?:;\d+)*u"         # kitty keyboard push: =1;1u
+    r"|\x1b\[\?u"                    # kitty keyboard query
+    r")+"
+)
+
+
+def _es_ruido_de_modo(chunk) -> bool:
+    """True si el chunk es EXCLUSIVAMENTE secuencias de set/reset de modo del
+    terminal (no pinta ni mueve nada). Ver _MODO_NOOP_RE."""
+    if not chunk or not isinstance(chunk, str):
+        # chunk vacío o bytes (no debería: winpty devuelve str) → NO es ruido,
+        # que es el lado seguro (cuenta como actividad, como siempre).
+        return False
+    return _MODO_NOOP_RE.fullmatch(chunk) is not None
+
+
 def _parse_usage_segmento(seg_text: str) -> tuple:
     """Parsea un segmento (Weekly o Five Hour) y devuelve (pct_usado, reset_seg)
     o (None, None) si no se pudo parsear. Granularidad: 0.01% (del bar); el
@@ -2112,9 +2159,14 @@ def capturar_slash_command(
     devuelve el snapshot pyte final + history + raw + métricas.
 
     Patrón distinto al de `capturar()` (sin marcadores INICIO/FIN): cierra
-    SIEMPRE por quiescencia (`bytes congelados N segundos`). Sin
-    MIN_BYTES_PLAUSIBLES — el TUI ya pintó el corona antes de la primera
-    quiescencia, así que cualquier cantidad de bytes nuevos vale.
+    SIEMPRE por quiescencia (`bytes ÚTILES congelados N segundos` — el latido de
+    modo del TUI no cuenta, ver _es_ruido_de_modo). Sin MIN_BYTES_PLAUSIBLES —
+    el TUI ya pintó el corona antes de la primera quiescencia, así que cualquier
+    cantidad de bytes útiles vale.
+
+    Un TIMEOUT del READY no aborta: se manda el comando igual y decide la
+    respuesta (el veredicto de main_usage se apoya en el CONTENIDO de la
+    pantalla, no en cómo cerró la captura).
 
     Devuelve dict con: ok, snapshot, history, raw, bytes_total, exitstatus,
     pid, estado, error, duracion_seg, ready_ok (bool), post_ok (bool).
@@ -2126,13 +2178,20 @@ def capturar_slash_command(
 
     raw_parts: list = []
     total_bytes = 0
+    # `bytes_utiles` excluye el latido de modo del TUI (ver _es_ruido_de_modo):
+    # es el que decide la quiescencia. `total_bytes` sigue contando TODO, para
+    # que el forense refleje el stream real.
+    bytes_utiles = 0
+    ruido_ignorado = 0
     t0 = time.monotonic()
     estado = "ERROR_SPAWN"
     error: Optional[str] = None
     pid: Optional[int] = None
     exitstatus: Optional[int] = None
     ready_ok = False
+    ready_motivo = "NO_CORRIO"
     post_ok = False
+    post_motivo = "NO_CORRIO"
 
     try:
         proc = winpty.PtyProcess.spawn(argv, cwd=cwd, env=env, dimensions=(rows, cols))
@@ -2173,13 +2232,18 @@ def capturar_slash_command(
     reader = threading.Thread(target=_reader, name="conpty-usage-reader", daemon=True)
     reader.start()
 
-    def _drenar(quiescent_seg: float, total_timeout: float, label: str) -> bool:
-        """Drena el queue hasta que pasen N segundos sin nuevos bytes (o
-        total_timeout). Devuelve True si quiescente, False si TIMEOUT o PROC_EXIT."""
-        nonlocal total_bytes
+    def _drenar(quiescent_seg: float, total_timeout: float, label: str) -> tuple:
+        """Drena el queue hasta que pasen N segundos sin bytes ÚTILES (o
+        total_timeout). Devuelve (ok, motivo) con motivo ∈ {QUIESCENT, TIMEOUT,
+        PROC_EXIT, READER_EXC}.
+
+        "Útiles" = todo menos el latido de modo del TUI (_es_ruido_de_modo):
+        esos chunks se feedean al grid y suman a `total_bytes` (forense fiel),
+        pero no reinician la ventana de quiescencia ni habilitan el cierre."""
+        nonlocal total_bytes, bytes_utiles, ruido_ignorado
         local_t0 = time.monotonic()
         last_byte = local_t0
-        bytes_at_entry = total_bytes
+        utiles_at_entry = bytes_utiles
         last_tick = local_t0
         while True:
             now = time.monotonic()
@@ -2187,46 +2251,68 @@ def capturar_slash_command(
                 if verbose:
                     sys.stderr.write(
                         f"[agy-usage] {label}: TIMEOUT t={int(now-local_t0)}s "
-                        f"bytes_nuevos={total_bytes-bytes_at_entry}\n")
-                return False
+                        f"bytes_utiles={bytes_utiles-utiles_at_entry} "
+                        f"ruido_ignorado={ruido_ignorado}\n")
+                return (False, "TIMEOUT")
             try:
                 item = q.get(timeout=0.2)
                 if item is None:
                     if verbose:
                         sys.stderr.write(f"[agy-usage] {label}: PROC_EXIT\n")
-                    return False
+                    return (False, "PROC_EXIT")
                 elif isinstance(item, tuple) and item and item[0] == "__EXC__":
                     if verbose:
                         sys.stderr.write(f"[agy-usage] {label}: reader exc {item[1]}\n")
-                    return False
+                    return (False, "READER_EXC")
                 else:
                     raw_parts.append(item)
                     total_bytes += len(item)
-                    last_byte = now
                     plain_stream.feed(item)
                     hist_stream.feed(item)
+                    if _es_ruido_de_modo(item):
+                        ruido_ignorado += 1
+                    else:
+                        bytes_utiles += len(item)
+                        last_byte = now
             except queue.Empty:
                 pass
             if ((now - last_byte) >= quiescent_seg
-                    and (total_bytes - bytes_at_entry) > 0):
+                    and (bytes_utiles - utiles_at_entry) > 0):
                 if verbose:
                     sys.stderr.write(
                         f"[agy-usage] {label}: QUIESCENT t={int(now-local_t0)}s "
-                        f"bytes_nuevos={total_bytes-bytes_at_entry}\n")
-                return True
+                        f"bytes_utiles={bytes_utiles-utiles_at_entry} "
+                        f"ruido_ignorado={ruido_ignorado}\n")
+                return (True, "QUIESCENT")
             if verbose and int(now - last_tick) >= 10:
                 last_tick = now
                 sys.stderr.write(
                     f"[agy-usage] {label}: t={int(now-local_t0)}s "
-                    f"bytes_nuevos={total_bytes-bytes_at_entry} alive={proc.isalive()}\n")
+                    f"bytes_utiles={bytes_utiles-utiles_at_entry} "
+                    f"ruido_ignorado={ruido_ignorado} alive={proc.isalive()}\n")
 
     try:
         # FASE 1: esperar TUI listo
-        ready_ok = _drenar(ready_quiescent_seg, ready_timeout_seg, "READY")
-        if not ready_ok:
-            estado = "READY_TIMEOUT"
-            error = "tui_no_listo_dentro_de_timeout"
+        ready_ok, ready_motivo = _drenar(ready_quiescent_seg, ready_timeout_seg, "READY")
+        if not ready_ok and ready_motivo in ("PROC_EXIT", "READER_EXC"):
+            # agy murió antes de que pudiéramos mandar el comando: no hay nada
+            # que escribir ni que esperar.
+            estado = "PROC_EXIT"
+            error = f"agy_murio_antes_del_comando ({ready_motivo})"
         else:
+            # Un TIMEOUT del READY NO aborta (2026-08-20). El gesto es el mismo
+            # que capturar_paste() hace desde el bump v39: la quiescencia es una
+            # heurística de "TUI listo", no una verdad; si la TUI cambia de
+            # comportamiento (el latido de modo de agy 1.1.14 fue exactamente
+            # eso) el chequeo entero moría con la pantalla ya pintada y lista.
+            # Mandamos el comando igual y que decida la FASE 3 + el parser: el
+            # veredicto final se apoya en el CONTENIDO de la pantalla, así que
+            # seguir no puede fabricar un dato falso, sólo recuperar uno bueno.
+            if not ready_ok:
+                if verbose:
+                    sys.stderr.write(
+                        f"[agy-usage] READY: {ready_motivo} — mando {slash_cmd!r} "
+                        f"igual; decide la respuesta\n")
             # FASE 2: mandar slash command + Enter
             try:
                 proc.write(slash_cmd + "\r")
@@ -2235,13 +2321,18 @@ def capturar_slash_command(
             except Exception as e:
                 estado = "WRITE_FAIL"
                 error = f"write_fail: {type(e).__name__}: {e}"
-                ready_ok = False  # tratado como fallido
             if estado != "WRITE_FAIL":
                 # FASE 3: esperar respuesta
-                post_ok = _drenar(post_quiescent_seg, post_timeout_seg, "USAGE")
+                post_ok, post_motivo = _drenar(post_quiescent_seg, post_timeout_seg, "USAGE")
                 if not post_ok:
-                    estado = "POST_TIMEOUT"
-                    error = "respuesta_no_quiescent_dentro_de_timeout"
+                    estado = "POST_TIMEOUT" if post_motivo == "TIMEOUT" else post_motivo
+                    error = ("respuesta_no_quiescent_dentro_de_timeout"
+                             if post_motivo == "TIMEOUT"
+                             else f"respuesta_interrumpida ({post_motivo})")
+                elif not ready_ok:
+                    # Cerró bien pero el READY había hecho timeout: lo dejamos
+                    # visible en el estado para que el forense no lo esconda.
+                    estado = "OK_QUIESCENT_READY_TIMEOUT"
                 else:
                     estado = "OK_QUIESCENT"
     finally:
@@ -2262,18 +2353,22 @@ def capturar_slash_command(
     duracion = round(time.monotonic() - t0, 2)
 
     return {
-        "ok": (estado == "OK_QUIESCENT") and post_ok,
+        "ok": post_ok,
         "snapshot": snapshot,
         "history": history,
         "raw": raw,
         "bytes_total": total_bytes,
+        "bytes_utiles": bytes_utiles,
+        "ruido_ignorado": ruido_ignorado,
         "exitstatus": exitstatus,
         "pid": pid,
         "estado": estado,
         "error": error,
         "duracion_seg": duracion,
         "ready_ok": ready_ok,
+        "ready_motivo": ready_motivo,
         "post_ok": post_ok,
+        "post_motivo": post_motivo,
     }
 
 
@@ -2379,15 +2474,28 @@ def main_usage(args, t0_total: float) -> int:
     cap_ok = bool(cap.get("ok"))
     gemini_ok = bool(parsed.get("gemini_block_found"))
     weekly_ok = parsed.get("weekly_pct_usado") is not None
-    veredicto_ok = cap_ok and gemini_ok and weekly_ok
+    # El veredicto lo decide el CONTENIDO de la pantalla, no cómo cerró la
+    # captura (2026-08-20). El bloque GEMINI MODELS con su weekly parseado sólo
+    # puede venir de un /usage que respondió: si está, el dato es bueno aunque
+    # la quiescencia haya fallado. Al revés no aplica — sin bloque no hay dato,
+    # con o sin quiescencia. Esto desacopla el chequeo de cuota de los cambios
+    # de comportamiento del TUI (el latido de modo de agy 1.1.14 tumbó el
+    # chequeo entero durante 2 días con la pantalla lista y legible).
+    veredicto_ok = gemini_ok and weekly_ok
     if not veredicto_ok:
-        if not cap_ok:
-            error_msg = f"captura_fallo: estado={cap.get('estado')} err={cap.get('error')}"
-        elif not gemini_ok:
+        if not gemini_ok:
             error_msg = (f"bloque_gemini_no_encontrado en snapshot ({len(cap.get('snapshot') or '')} chars); "
+                         f"estado={cap.get('estado')} err={cap.get('error')}; "
                          f"parser_notes={parsed.get('parser_notes')}")
         else:
-            error_msg = (f"weekly_no_parseado; parser_notes={parsed.get('parser_notes')}")
+            error_msg = (f"weekly_no_parseado; estado={cap.get('estado')}; "
+                         f"parser_notes={parsed.get('parser_notes')}")
+    elif not cap_ok:
+        # Dato bueno con captura sucia: NO es error (ok=True), pero queda
+        # anotado para que el forense muestre por qué el cierre no fue limpio.
+        error_msg = None
+        parsed.setdefault("parser_notes", []).append(
+            f"dato_rescatado_pese_a_captura: estado={cap.get('estado')} err={cap.get('error')}")
     else:
         error_msg = None
 
@@ -2407,8 +2515,12 @@ def main_usage(args, t0_total: float) -> int:
         "duracion_seg":     round(time.time() - t0_total, 2),
         "estado_captura":   cap.get("estado"),
         "bytes_total":      cap.get("bytes_total", 0),
+        "bytes_utiles":     cap.get("bytes_utiles", 0),
+        "ruido_ignorado":   cap.get("ruido_ignorado", 0),
         "ready_ok":         cap.get("ready_ok", False),
+        "ready_motivo":     cap.get("ready_motivo"),
         "post_ok":          cap.get("post_ok", False),
+        "post_motivo":      cap.get("post_motivo"),
         "parser_notes":     parsed.get("parser_notes", []),
         "fecha_iso":        datetime.now().isoformat(timespec='seconds'),
     }
@@ -2430,8 +2542,10 @@ def main_usage(args, t0_total: float) -> int:
         (debug_dir / "usage_raw.txt").write_text(cap.get("raw", ""), encoding='utf-8', errors='replace')
         (debug_dir / "usage_metrics.json").write_text(json.dumps({
             "ok": out["ok"], "veredicto": out["veredicto"], "estado": out["estado_captura"],
-            "bytes_total": out["bytes_total"], "duracion_seg": out["duracion_seg"],
-            "ready_ok": out["ready_ok"], "post_ok": out["post_ok"],
+            "bytes_total": out["bytes_total"], "bytes_utiles": out["bytes_utiles"],
+            "ruido_ignorado": out["ruido_ignorado"], "duracion_seg": out["duracion_seg"],
+            "ready_ok": out["ready_ok"], "ready_motivo": out["ready_motivo"],
+            "post_ok": out["post_ok"], "post_motivo": out["post_motivo"],
             "error": out["error"], "parser_notes": out["parser_notes"],
         }, indent=2, ensure_ascii=False), encoding='utf-8')
     except Exception as _e:
