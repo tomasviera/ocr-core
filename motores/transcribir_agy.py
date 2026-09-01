@@ -1959,6 +1959,9 @@ USAGE_READY_QUIESCENT_SEG = 5.0
 USAGE_READY_TIMEOUT_SEG   = 90.0
 USAGE_POST_QUIESCENT_SEG  = 5.0
 USAGE_POST_TIMEOUT_SEG    = 45.0
+# Reenvios del /usage cuando la pantalla vuelve sin el bloque GEMINI MODELS
+# (v45). Tope TOTAL de intentos, no de reintentos.
+USAGE_MAX_INTENTOS_CMD    = 3
 
 # Regex del header "35% remaining · Refreshes in 125h 28m" (para reset_seg) y
 # del bar `[███░░░...] 5.65%` (para el pct con decimales). Historia:
@@ -2030,6 +2033,45 @@ def _es_ruido_de_modo(chunk) -> bool:
         # que es el lado seguro (cuenta como actividad, como siempre).
         return False
     return _MODO_NOOP_RE.fullmatch(chunk) is not None
+
+
+# ── Gate de "TUI listo" para el modo usage (v45, 2026-09-01) ─────────────────
+# La quiescencia sola NO alcanza como prueba de que el TUI acepta input. En el
+# arranque en frío agy emite ~23 bytes de handshake del terminal y se queda
+# MUDO varios segundos mientras hace el sign-in contra Google; a los 5 s de
+# USAGE_READY_QUIESCENT_SEG el drenador declaraba "listo", escribíamos /usage
+# contra un TUI que todavía no leía stdin, y el repintado posterior del corona
+# se comía el texto: la pantalla final quedaba con el prompt `>` VACÍO y el
+# parser reportaba `bloque_gemini_no_encontrado`. Firma exacta del fallo en el
+# forense: `READY: QUIESCENT t=5s bytes_utiles=23`. Todas las corridas OK
+# cierran el READY con 2.700-3.900 bytes a los 13-16 s (el corona ya pintado).
+#
+# El gate exige EVIDENCIA POSITIVA en la pantalla: la línea de versión del
+# corona + la línea del prompt vacío. Es fail-safe: si el TUI cambia y el gate
+# no matchea nunca, el READY termina en TIMEOUT — que desde el v44 NO aborta
+# (se manda el comando igual). Nunca puede fabricar un dato, sólo esperar más.
+#
+# NO se chequea la ausencia de "not signed in": esa línea del arranque queda
+# arriba en el grid pyte aun después de que el corona se pintó (el TUI hace
+# ESC[9A + ESC[J y no borra por encima), así que exigir su ausencia colgaría
+# el gate para siempre.
+_TUI_LISTO_BANNER_RE = re.compile(r"Antigravity\s+CLI\s+\d+\.\d+", re.IGNORECASE)
+_TUI_LISTO_PROMPT_RE = re.compile(r"^\s*>\s*$", re.MULTILINE)
+
+
+def _tui_listo(snapshot: str) -> bool:
+    """True si la pantalla ya muestra el corona (línea de versión) Y el prompt
+    vacío, es decir el TUI terminó de arrancar y está esperando input."""
+    if not snapshot:
+        return False
+    return (_TUI_LISTO_BANNER_RE.search(snapshot) is not None
+            and _TUI_LISTO_PROMPT_RE.search(snapshot) is not None)
+
+
+def _hay_bloque_gemini(snapshot: str) -> bool:
+    """True si la pantalla trae el bloque GEMINI MODELS — el contenido que el
+    /usage tiene que haber dejado. Se usa para decidir si vale reintentar."""
+    return bool(snapshot) and _USAGE_GEMINI_BLOCK_RE.search(snapshot) is not None
 
 
 def _parse_usage_segmento(seg_text: str) -> tuple:
@@ -2152,6 +2194,9 @@ def capturar_slash_command(
     post_quiescent_seg:  float = USAGE_POST_QUIESCENT_SEG,
     post_timeout_seg:    float = USAGE_POST_TIMEOUT_SEG,
     read_size: int = 4096,
+    listo_fn=None,
+    respuesta_ok_fn=None,
+    max_intentos: int = 3,
     verbose: bool = True,
 ) -> dict:
     """Lanza `argv` bajo ConPTY; espera quiescencia (TUI listo) y manda
@@ -2167,6 +2212,16 @@ def capturar_slash_command(
     Un TIMEOUT del READY no aborta: se manda el comando igual y decide la
     respuesta (el veredicto de main_usage se apoya en el CONTENIDO de la
     pantalla, no en cómo cerró la captura).
+
+    `listo_fn(snapshot) -> bool` (opcional, v45): gate de CONTENIDO para el
+    READY. Con él, la quiescencia sola no cierra la fase: hace falta además
+    que la pantalla pruebe que el TUI arrancó (ver _tui_listo). Sin él, el
+    comportamiento es el de siempre.
+
+    `respuesta_ok_fn(snapshot) -> bool` (opcional, v45): gate de CONTENIDO
+    para la respuesta. Si tras la fase 3 la pantalla no lo satisface y el
+    proceso sigue vivo, se REENVÍA el comando (hasta `max_intentos` en
+    total). Cubre el caso de un comando comido por un repintado.
 
     Devuelve dict con: ok, snapshot, history, raw, bytes_total, exitstatus,
     pid, estado, error, duracion_seg, ready_ok (bool), post_ok (bool).
@@ -2192,6 +2247,7 @@ def capturar_slash_command(
     ready_motivo = "NO_CORRIO"
     post_ok = False
     post_motivo = "NO_CORRIO"
+    intentos_cmd = 0
 
     try:
         proc = winpty.PtyProcess.spawn(argv, cwd=cwd, env=env, dimensions=(rows, cols))
@@ -2232,19 +2288,26 @@ def capturar_slash_command(
     reader = threading.Thread(target=_reader, name="conpty-usage-reader", daemon=True)
     reader.start()
 
-    def _drenar(quiescent_seg: float, total_timeout: float, label: str) -> tuple:
+    def _drenar(quiescent_seg: float, total_timeout: float, label: str,
+                gate_fn=None) -> tuple:
         """Drena el queue hasta que pasen N segundos sin bytes ÚTILES (o
         total_timeout). Devuelve (ok, motivo) con motivo ∈ {QUIESCENT, TIMEOUT,
         PROC_EXIT, READER_EXC}.
 
         "Útiles" = todo menos el latido de modo del TUI (_es_ruido_de_modo):
         esos chunks se feedean al grid y suman a `total_bytes` (forense fiel),
-        pero no reinician la ventana de quiescencia ni habilitan el cierre."""
+        pero no reinician la ventana de quiescencia ni habilitan el cierre.
+
+        `gate_fn(snapshot)` (v45): si está y devuelve False, una quiescencia
+        NO cierra la fase — se reinicia la ventana y se sigue drenando hasta
+        el total_timeout. Es la diferencia entre "no llegan bytes" y "la
+        pantalla ya muestra lo que esperábamos"."""
         nonlocal total_bytes, bytes_utiles, ruido_ignorado
         local_t0 = time.monotonic()
         last_byte = local_t0
         utiles_at_entry = bytes_utiles
         last_tick = local_t0
+        gate_avisado = False
         while True:
             now = time.monotonic()
             if now - local_t0 >= total_timeout:
@@ -2278,6 +2341,18 @@ def capturar_slash_command(
                 pass
             if ((now - last_byte) >= quiescent_seg
                     and (bytes_utiles - utiles_at_entry) > 0):
+                if gate_fn is not None and not gate_fn(_screen_text(plain)):
+                    # Quiescencia con la pantalla todavía sin lo que
+                    # esperábamos: NO es cierre. Reiniciamos la ventana y
+                    # seguimos hasta el total_timeout.
+                    last_byte = now
+                    if verbose and not gate_avisado:
+                        gate_avisado = True
+                        sys.stderr.write(
+                            f"[agy-usage] {label}: quiescencia SIN gate de "
+                            f"contenido t={int(now-local_t0)}s "
+                            f"bytes_utiles={bytes_utiles-utiles_at_entry} — sigo esperando\n")
+                    continue
                 if verbose:
                     sys.stderr.write(
                         f"[agy-usage] {label}: QUIESCENT t={int(now-local_t0)}s "
@@ -2293,7 +2368,8 @@ def capturar_slash_command(
 
     try:
         # FASE 1: esperar TUI listo
-        ready_ok, ready_motivo = _drenar(ready_quiescent_seg, ready_timeout_seg, "READY")
+        ready_ok, ready_motivo = _drenar(ready_quiescent_seg, ready_timeout_seg, "READY",
+                                         gate_fn=listo_fn)
         if not ready_ok and ready_motivo in ("PROC_EXIT", "READER_EXC"):
             # agy murió antes de que pudiéramos mandar el comando: no hay nada
             # que escribir ni que esperar.
@@ -2313,17 +2389,31 @@ def capturar_slash_command(
                     sys.stderr.write(
                         f"[agy-usage] READY: {ready_motivo} — mando {slash_cmd!r} "
                         f"igual; decide la respuesta\n")
-            # FASE 2: mandar slash command + Enter
-            try:
-                proc.write(slash_cmd + "\r")
-                if verbose:
-                    sys.stderr.write(f"[agy-usage] write OK: {slash_cmd!r}\n")
-            except Exception as e:
-                estado = "WRITE_FAIL"
-                error = f"write_fail: {type(e).__name__}: {e}"
-            if estado != "WRITE_FAIL":
+            # FASES 2 y 3, con reintento del comando (v45): si la pantalla no
+            # trae lo que esperabamos y agy sigue vivo, el comando pudo haberse
+            # perdido en un repintado => se reenvia. Sin `respuesta_ok_fn` el
+            # loop corre una sola vuelta (comportamiento previo).
+            _tope_intentos = max(1, max_intentos)
+            # Techo de tiempo de los reintentos: el wrapper PHP mata el
+            # subprocess a timeout+60 y READY_TIMEOUT ya consumio lo suyo.
+            # Sin esto, 3 vueltas de POST_TIMEOUT podrian pasarse del cap y
+            # cambiar un error parseado por un proc_timeout ciego.
+            _deadline_reintentos = t0 + ready_timeout_seg
+            for intento in range(1, _tope_intentos + 1):
+                intentos_cmd = intento
+                # FASE 2: mandar slash command + Enter
+                try:
+                    proc.write(slash_cmd + "\r")
+                    if verbose:
+                        sys.stderr.write(
+                            f"[agy-usage] write OK: {slash_cmd!r} (intento {intento}/{_tope_intentos})\n")
+                except Exception as e:
+                    estado = "WRITE_FAIL"
+                    error = f"write_fail: {type(e).__name__}: {e}"
+                    break
                 # FASE 3: esperar respuesta
-                post_ok, post_motivo = _drenar(post_quiescent_seg, post_timeout_seg, "USAGE")
+                post_ok, post_motivo = _drenar(post_quiescent_seg, post_timeout_seg,
+                                               f"USAGE#{intento}")
                 if not post_ok:
                     estado = "POST_TIMEOUT" if post_motivo == "TIMEOUT" else post_motivo
                     error = ("respuesta_no_quiescent_dentro_de_timeout"
@@ -2333,8 +2423,28 @@ def capturar_slash_command(
                     # Cerró bien pero el READY había hecho timeout: lo dejamos
                     # visible en el estado para que el forense no lo esconda.
                     estado = "OK_QUIESCENT_READY_TIMEOUT"
+                    error = None
                 else:
                     estado = "OK_QUIESCENT"
+                    error = None
+                if respuesta_ok_fn is None or respuesta_ok_fn(_screen_text(plain)):
+                    break
+                try:
+                    _vivo = proc.isalive()
+                except Exception:
+                    _vivo = False
+                if (intento >= _tope_intentos
+                        or post_motivo in ("PROC_EXIT", "READER_EXC")
+                        or time.monotonic() >= _deadline_reintentos
+                        or not _vivo):
+                    if error is None:
+                        error = (f"respuesta_sin_contenido_esperado tras {intento} "
+                                 f"intento(s); estado={estado}")
+                    break
+                if verbose:
+                    sys.stderr.write(
+                        f"[agy-usage] USAGE#{intento}: la pantalla no trae la "
+                        f"respuesta esperada - reenvio {slash_cmd!r}\n")
     finally:
         stop_flag.set()
         try:
@@ -2369,6 +2479,7 @@ def capturar_slash_command(
         "ready_motivo": ready_motivo,
         "post_ok": post_ok,
         "post_motivo": post_motivo,
+        "intentos_cmd": intentos_cmd,
     }
 
 
@@ -2434,6 +2545,9 @@ def main_usage(args, t0_total: float) -> int:
         ready_timeout_seg=float(args.timeout),
         post_quiescent_seg=USAGE_POST_QUIESCENT_SEG,
         post_timeout_seg=USAGE_POST_TIMEOUT_SEG,
+        listo_fn=_tui_listo,
+        respuesta_ok_fn=_hay_bloque_gemini,
+        max_intentos=USAGE_MAX_INTENTOS_CMD,
         verbose=True,
     )
 
@@ -2521,6 +2635,7 @@ def main_usage(args, t0_total: float) -> int:
         "ready_motivo":     cap.get("ready_motivo"),
         "post_ok":          cap.get("post_ok", False),
         "post_motivo":      cap.get("post_motivo"),
+        "intentos_cmd":     cap.get("intentos_cmd", 0),
         "parser_notes":     parsed.get("parser_notes", []),
         "fecha_iso":        datetime.now().isoformat(timespec='seconds'),
     }
@@ -2546,6 +2661,7 @@ def main_usage(args, t0_total: float) -> int:
             "ruido_ignorado": out["ruido_ignorado"], "duracion_seg": out["duracion_seg"],
             "ready_ok": out["ready_ok"], "ready_motivo": out["ready_motivo"],
             "post_ok": out["post_ok"], "post_motivo": out["post_motivo"],
+            "intentos_cmd": out["intentos_cmd"],
             "error": out["error"], "parser_notes": out["parser_notes"],
         }, indent=2, ensure_ascii=False), encoding='utf-8')
     except Exception as _e:
