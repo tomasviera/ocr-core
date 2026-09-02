@@ -2871,6 +2871,141 @@ def setear_modelo_global(home_dir: Optional[Path], modelo: str) -> Optional[str]
 
 
 # ============================================================
+# FOLDER-TRUST DEL SANDBOX (project grant del HOME de agy)
+# ============================================================
+
+# Incidente 2026-09-01 (repite el de 1.1.3 del 2026-07-15): agy en `-p` solo
+# puede leer `imagen.jpg`/`prompt.md` del sandbox si el HOME tiene un
+# folder-trust sobre esa carpeta en `projectResources` del store de proyectos
+# (`~/.gemini/config/projects/<project-id>.json`). `trustedWorkspaces` del
+# settings NO alcanza para el soft-deny headless -- ver
+# `prensadelplata/WEB/planificacion/notas/agy_1.1.3_permisos_read_file.md`.
+#
+# Ese grant se venia poniendo A MANO, una vez por host, y NADA lo reaseguraba.
+# El 2026-09-01 21:32 abrir el IDE de Antigravity reescribio el archivo dejando
+# `projectResources: {}` -> el 100 % de los jobs del host paso a morir con
+# `jetski_headless_deny: tool='read_file'` (639 jobs re-encolados, host
+# autopausado a los 7 minutos). El binario no tuvo nada que ver: 1.1.23 corrio
+# 4 h 35 sin un solo fallo mientras el grant estuvo puesto.
+#
+# Por eso se asegura aca, por job: es idempotente, cuesta una lectura de un
+# JSON de 200 bytes, cubre todos los hosts y slots sin setup manual, y corre en
+# el subprocess fresco de cada job (no requiere reiniciar workers).
+#
+# Se confia el dir PADRE del sandbox (`.../agy_sandbox_web`), no el slot: cubre
+# `default_1`, `smoke_1`, etc. con un solo recurso, que es como quedo cableado
+# en prod desde julio.
+
+def _norm_folder_uri(uri: str) -> str:
+    """Normaliza un folderUri para comparar shapes distintos del mismo folder.
+
+    agy escribe hoy `file:///e%3A/ruta` (percent-encoded) y el grant historico
+    de prod es `file://E:/ruta`. Los dos apuntan al mismo lado, asi que se
+    comparan decodificados, en minusculas, sin `file://` ni barras sobrantes.
+    """
+    if not isinstance(uri, str):
+        return ""
+    s = uri.strip().replace("%3A", ":").replace("%3a", ":").replace("\\", "/")
+    if s.lower().startswith("file://"):
+        s = s[7:]
+    return s.strip("/").lower()
+
+
+def _resources_del_store(pr) -> list:
+    """Lista de recursos de `projectResources`, tolerante a `{}` / basura."""
+    if isinstance(pr, dict):
+        res = pr.get("resources")
+        if isinstance(res, list):
+            return res
+    return []
+
+
+def _folder_uris_declarados(resources: list):
+    """Yield de cada folderUri presente, sea shape plano o `gitFolder`."""
+    for r in resources:
+        if not isinstance(r, dict):
+            continue
+        if isinstance(r.get("folderUri"), str):
+            yield r["folderUri"]
+        gf = r.get("gitFolder")
+        if isinstance(gf, dict) and isinstance(gf.get("folderUri"), str):
+            yield gf["folderUri"]
+
+
+def asegurar_project_grant(home_dir: Optional[Path], sandbox_dir: Path):
+    """Asegura el folder-trust del sandbox en el store de proyectos de agy.
+
+    Idempotente: si el folder ya esta confiado (en cualquiera de los dos
+    shapes), no toca el archivo. Si falta, lo agrega con el shape read-only
+    `{"folderUri": ...}` -- el mismo validado en prod, que NO da escritura
+    (`gitFolder.allowWrite` si la daria y romperia la contencion).
+
+    Devuelve `(err, agregado)`: `err` es None si OK o string si fallo;
+    `agregado` es True solo si este llamado escribio el grant que faltaba.
+    El caller NO debe abortar ante error: sin el grant agy muere con
+    `jetski_headless_deny`, que el pipeline ya clasifica.
+    """
+    base = home_dir if home_dir is not None else Path.home()
+    cfg_dir = base / ".gemini" / "config" / "projects"
+
+    # El project-id efectivo lo publica el propio agy; `default-cli-project` es
+    # el default historico y el fallback si el cache no esta.
+    project_id = "default-cli-project"
+    cache_id = base / ".gemini" / "antigravity-cli" / "cache" / "default_project_id.txt"
+    try:
+        if cache_id.is_file():
+            leido = cache_id.read_text(encoding="utf-8").strip()
+            # Guarda: tiene que ser un nombre de archivo, no una ruta.
+            if leido and "/" not in leido and "\\" not in leido and ".." not in leido:
+                project_id = leido
+    except Exception:
+        pass
+
+    store = cfg_dir / (project_id + ".json")
+    folder = sandbox_dir.parent
+    folder_uri = "file://" + str(folder).replace("\\", "/")
+
+    try:
+        data = {}
+        if store.is_file():
+            raw = store.read_text(encoding="utf-8")
+            if raw.strip():
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    # Store corrupto: agy tampoco puede leerlo, asi que
+                    # reconstruirlo es estrictamente mejor que abortar.
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
+
+        pr = data.get("projectResources")
+        resources = _resources_del_store(pr)
+
+        objetivo = _norm_folder_uri(folder_uri)
+        for uri in _folder_uris_declarados(resources):
+            if _norm_folder_uri(uri) == objetivo:
+                return (None, False)  # ya confiado
+
+        # Falta: lo agregamos preservando lo que ya hubiera (el IDE puede haber
+        # dejado grants propios y no son nuestros para borrar).
+        resources = list(resources) + [{"folderUri": folder_uri}]
+        data.setdefault("id", project_id)
+        data.setdefault("name", "CLI Project")
+        data["projectResources"] = {"resources": resources}
+
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        # tmp por-PID: varios slots del mismo HOME pueden entrar a la vez.
+        tmp = store.with_suffix(".json.tmp%d" % os.getpid())
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(store)
+        return (None, True)
+    except Exception as e:
+        return ("project_grant_fallo: %s: %s" % (type(e).__name__, e), False)
+
+
+
+# ============================================================
 # KILL del árbol agy + barrido del language server detached
 # (espejo de _kill_arbol / _barrido_zombis del smoke)
 # ============================================================
@@ -5058,6 +5193,20 @@ def main() -> int:
             # comportamiento histórico (resolución no determinística por el scratch
             # resolver), que sigue cubierto por _limpiar_estado_agy + _stagear_en_scratch.
             sys.stderr.write(f"[agy] WARN no pude reescribir refs absolutas: {e}\n")
+
+    # ── Folder-trust del sandbox en el store de proyectos de agy ──
+    # Idempotente y barato. Si falta el grant, agy en `-p` no puede leer
+    # imagen.jpg/prompt.md y muere con jetski_headless_deny (incidente
+    # 2026-09-01, ver asegurar_project_grant). No aborta el job: si esto
+    # falla, el fallo posterior queda clasificado por el pipeline normal.
+    err_grant, grant_agregado = asegurar_project_grant(home_dir, sandbox_dir)
+    if err_grant:
+        sys.stderr.write("[agy] WARN asegurar_project_grant: %s\n" % err_grant)
+    elif grant_agregado:
+        sys.stderr.write(
+            "[agy] project grant del sandbox FALTABA y fue restaurado "
+            "(alguien reseteo el store de proyectos de agy — tipicamente "
+            "abrir el IDE de Antigravity)\n")
 
     # ── Modelo global (NO-OP si --modelo-agy vacío) ──
     err_mod = setear_modelo_global(home_dir, args.modelo_agy)
