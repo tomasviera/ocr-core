@@ -4603,17 +4603,37 @@ def shape_salida(
         firma_detectada = "A_jetski"
         ok = False
         # ── v43: TERMINAL → TRANSITORIO. Es el ÚNICO transitorio del motor que
-        # SÍ consumió cuota, y eso es deliberado. Lean esto antes de "arreglarlo":
+        # SÍ consumió cuota, y eso es deliberado. Lean esto antes de "arreglarlo".
         #
-        # El deny NO es determinístico por página: el modelo decide invocar
-        # `run_command` con un `echo` decorativo ("Generating transcription",
-        # "done") de forma esporádica — medido en ~1 % de los jobs, 22 casos en
-        # 30 días sobre 3 hosts y 3 cuentas distintas. La misma página reintentada
-        # normalmente transcribe bien, así que el reintento SÍ cambia el resultado
-        # (que es exactamente lo que el gate del v33 exige para justificar el
-        # gasto; lo que aquel incidente prohibió fue reintentar un fallo
-        # DETERMINÍSTICO, el INVALID_ARGUMENT 400).
+        # ── v47: el motivo se PARTE POR TOOL. Bajo la misma firma `jetski:`
+        # conviven dos fenómenos OPUESTOS, y emitir un motivo único hacía que la
+        # política del worker no los pudiera distinguir:
         #
+        #   `run_command` (y cualquier otra) → capricho del modelo. Esporádico
+        #     (~1 % de los jobs, 22 casos en 30 días sobre 3 hosts y 3 cuentas):
+        #     el modelo decide invocar un `echo` decorativo ("Generating
+        #     transcription", "done"). NO es salud del host ⇒ motivo
+        #     `tool_denegada_headless`, que prensa saca del ledger del breaker
+        #     por-intento (3 caprichos seguidos no deben pausar un host sano).
+        #
+        #   `read_file` → el folder-trust del sandbox (`projectResources` del
+        #     HOME) se perdió, así que agy en `-p` no puede leer `imagen.jpg` ni
+        #     `prompt.md`. DETERMINÍSTICO Y TOTAL: muere el 100 % de los jobs del
+        #     host. Pasó el 2026-09-01 (abrir el IDE de Antigravity vació el
+        #     store) y el host sangró 7 min. ⇒ motivo
+        #     `tool_denegada_headless_read_file`, que prensa SÍ manda al ledger
+        #     por-intento para que el breaker corte a los 3 jobs.
+        #
+        # Retrocompat: el prefijo del motivo nuevo NO colisiona con el
+        # `postgen_` que discrimina la política; un worker viejo que no conozca
+        # la etiqueta nueva cae en su default (cap 3, ledger sí) — degrada a más
+        # reintentos, no a algo roto.
+        #
+        # Por qué el deny de `run_command` es reintentable pese a haber gastado:
+        # no es determinístico por página — la misma página reintentada
+        # normalmente transcribe bien, que es exactamente lo que el gate del v33
+        # exige para justificar el gasto (lo que aquel incidente prohibió fue
+        # reintentar un fallo DETERMINÍSTICO, el INVALID_ARGUMENT 400).
         # Las dos capas previas están agotadas, no sin probar:
         #   - el prompt de producción ya dice literal "No uses `run_command`,
         #     `echo`, ni PowerShell" y el modelo lo lee (consta en el step 4 de
@@ -4621,26 +4641,40 @@ def shape_salida(
         #   - el allow `command(echo)` del bump v27 NO llega al set de permisos
         #     efectivo de agy (verificado en `executor_metadata` de 4 bundles de
         #     la sesión 428: sólo aparecen los deny, la string `echo` no está).
-        #     Por qué, es investigación abierta.
         # Y no hay nada que rescatar: en los 4 casos medidos agy murió en el
         # bloque de thinking, con 0 chars de transcripción en la .db.
         #
-        # El costo del reintento está acotado del lado del worker, NO acá: el
-        # motivo `tool_denegada_headless` viaja explícito para que prensa le
-        # aplique cap 1 (no el cap 3 de los transitorios sin consumo) y lo
-        # excluya del ledger del breaker por host — un capricho del modelo no es
-        # salud del host. Un core nuevo contra un worker viejo degrada a cap 3,
-        # no a algo roto.
+        # El costo del reintento está acotado del lado del worker, NO acá: los
+        # dos motivos viajan explícitos y `agyPoliticaReintento()`
+        # (includes/lib_worker_policy.php) les pone cap 2 = UN reintento, y
+        # decide el ledger según cuál sea.
         veredicto = "TRANSITORIO"
-        firma_transitorio_motivo_forzado = "tool_denegada_headless"
-        error = (
-            f"jetski_headless_deny: agy en -p auto-denegó la tool '{tool_denegada}' "
-            f"(headless no puede pedir confirmación interactiva) y murió sin emitir "
-            f"transcripción. Esporádico y NO determinístico por página ⇒ "
-            f"reintentable con cap corto, aunque haya consumido cuota. El fix de "
-            f"fondo es que el allow de esa tool llegue al set efectivo de agy "
-            f"(hoy `command(echo)` en SANDBOX_SETTINGS no llega)"
-        )
+        if tool_denegada == "read_file":
+            firma_transitorio_motivo_forzado = "tool_denegada_headless_read_file"
+            error = (
+                f"jetski_headless_deny: agy en -p auto-denegó la tool 'read_file' "
+                f"(headless no puede pedir confirmación interactiva) y murió sin "
+                f"emitir transcripción. NO es el capricho esporádico del modelo: "
+                f"significa que el sandbox NO está confiado en el store de "
+                f"proyectos del HOME (`~/.gemini/config/projects/<project-id>."
+                f"json` → `projectResources`), y sin ese grant muere el 100 % de "
+                f"los jobs del host, no ~1 %. Desde el core v46 "
+                f"`asegurar_project_grant()` lo repone en cada job, así que si "
+                f"esto aparece igual, mirar el WARN de esa función en el stderr "
+                f"del job y el JSON del store (lo vacía abrir el IDE de "
+                f"Antigravity). Detalle: notas/agy_1.1.3_permisos_read_file.md "
+                f"§REAPARICIÓN 2026-09-01 y notas/motor_agy.md §Bump v46"
+            )
+        else:
+            firma_transitorio_motivo_forzado = "tool_denegada_headless"
+            error = (
+                f"jetski_headless_deny: agy en -p auto-denegó la tool '{tool_denegada}' "
+                f"(headless no puede pedir confirmación interactiva) y murió sin emitir "
+                f"transcripción. Esporádico y NO determinístico por página ⇒ "
+                f"reintentable con cap corto, aunque haya consumido cuota. El fix de "
+                f"fondo es que el allow de esa tool llegue al set efectivo de agy "
+                f"(hoy `command(echo)` en SANDBOX_SETTINGS no llega)"
+            )
     elif ok and resp_stripped == "Error: Agent execution terminated due to error.":
         # ── B: executor terminated. SE PARTE EN DOS (bump v33, 2026-08-03) ────
         # Hasta v32 esta rama forzaba TRANSITORIO a secas, saltándose el gate
