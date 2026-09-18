@@ -4096,6 +4096,186 @@ def volcar_debug_bundle(debug_dir: Path, res: CaptureResult, metrics: dict,
 
 
 # ============================================================
+# BLOQUEO POR EL FILTRO DE GEMINI (core v48 — proyecto `bloqueo_filtro_gemini`)
+# ============================================================
+#
+# Gemini puede rechazar el pedido y pegar SU MENSAJE DE RECHAZO al final del
+# texto ya generado, sin separador («…de la reconquistaThe prompt could not be
+# submitted because…»). Dos variantes observadas:
+#   prompt_no_enviado → «The prompt could not be submitted because it contains
+#                        sensitive words that violate Google's Generative AI
+#                        Prohibited Use Policy…»
+#   filtro_gemini     → «This request was blocked by Gemini's filters. Filters
+#                        can occasionally trigger by mistake on safe coding,
+#                        security, or biology-related queries…»
+#
+# El mensaje corre SIEMPRE hasta el final del texto, así que lo que sigue a la
+# primera firma es mensaje. Se corta ahí y se retrocede al último límite de
+# palabra (el token pegado quedó cortado a mitad: «poderosThis request…»).
+#
+# ┌─ DOS COPIAS DEL PATRÓN, UNA POR REPO — a propósito ─────────────────────┐
+# │ La otra vive en prensa: `qaBloqueoFiltroFirmas` / `qaDetectarBloqueoFiltro`│
+# │ / `qaRecortarBloqueoFiltro` en `includes/lib_qa_detectores.php`, que es   │
+# │ la FUENTE ÚNICA del lado prensa (detector QA, clasificador de control,    │
+# │ gate `vigente_contaminada`, red del snapshot de publicación).            │
+# │ No se comparten porque son repos distintos y lenguajes distintos: el core │
+# │ es Python y se vendoriza a DOS consumidores (prensa y                    │
+# │ transcriptor-manuscritos-v3), y prensa no puede depender del core para un │
+# │ detector que tiene que correr también sobre el HISTÓRICO (texto viejo,    │
+# │ transcrito por motores que no son agy). Vendorizar el patrón al revés     │
+# │ (core → prensa) ataría el registry de QA al ciclo de bumps del core.      │
+# │ ⇒ CONTRATO: las dos copias tienen que dar el MISMO recorte byte a byte.   │
+# │ Si tocás el catálogo de firmas acá, tocá el de allá en el mismo trabajo y │
+# │ corré el test de equivalencia (`temp/tests/2026-09-18_f4_core_agy/`).     │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# Equivalencias con el PHP de prensa (verificadas byte a byte sobre los inputs
+# congelados de `temp/tests/2026-09-16_f1_clasificador/inputs/`):
+#   PHP `[^\p{L}\p{N}]`  ≡ Python `[\W_]`   (no-letra-y-no-dígito)
+#   PHP `[\p{L}\p{N}]`   ≡ Python `[^\W_]`  (letra o dígito)
+#   PHP `rtrim()` sin charlist  ≡ `.rstrip(_BLOQUEO_RTRIM_PHP)` (NO `.rstrip()`
+#     a secas: el de Python saca TODO blanco unicode y el de PHP sólo 5 bytes).
+# La rama no-unicode del PHP (fallback para UTF-8 inválido) no tiene contraparte
+# acá: en Python el texto ya es un `str` decodificado.
+
+# Charlist exacta del `rtrim()` de PHP: espacio, \t, \n, \r, NUL, \v.
+# Escrito con chr() a propósito (un escape con backslash puede llegar mutado si
+# el parche viaja por un heredoc — ver `lecciones_de_proceso.md §heredoc`).
+_BLOQUEO_RTRIM_PHP = " " + chr(9) + chr(10) + chr(13) + chr(0) + chr(11)
+
+# slug => (variante, [palabras…]). El ORDEN importa: a igual offset gana la
+# primera del catálogo (igual que el uasort estable de PHP). Varias firmas
+# empiezan en la misma frase con y sin el artículo a propósito: gana la que
+# empieza antes, así «The» queda del lado del mensaje.
+_BLOQUEO_FILTRO_FIRMAS = (
+    # ── variante «prompt no enviado» ──────────────────────────────────
+    ("pne_inicio",          "prompt_no_enviado", ("the", "prompt", "could", "not", "be", "submitted")),
+    ("pne_inicio_sin_art",  "prompt_no_enviado", ("prompt", "could", "not", "be", "submitted")),
+    ("pne_contiene",        "prompt_no_enviado", ("the", "prompt", "contains", "sensitive", "words")),
+    ("pne_sensitive",       "prompt_no_enviado", ("sensitive", "words", "that", "violate", "google")),
+    ("pne_policy",          "prompt_no_enviado", ("generative", "ai", "prohibited", "use", "policy")),
+    ("pne_rephrasing",      "prompt_no_enviado", ("try", "rephrasing", "the", "prompt")),
+    ("pne_error",           "prompt_no_enviado", ("if", "you", "think", "this", "was", "an", "error", "send", "feedback")),
+    # ── variante «filtro de Gemini» ──────────────────────────────────
+    ("fg_inicio",           "filtro_gemini", ("this", "request", "was", "blocked", "by", "gemini")),
+    ("fg_inicio_sin_art",   "filtro_gemini", ("request", "was", "blocked", "by", "gemini")),
+    ("fg_filters",          "filtro_gemini", ("blocked", "by", "gemini", "s", "filters")),
+    ("fg_trigger",          "filtro_gemini", ("occasionally", "trigger", "by", "mistake")),
+    ("fg_coding",           "filtro_gemini", ("safe", "coding", "security")),
+    ("fg_biology",          "filtro_gemini", ("biology", "related", "queries")),
+    ("fg_rephrasing",       "filtro_gemini", ("please", "try", "rephrasing", "your")),
+    ("fg_rephrasing_sin",   "filtro_gemini", ("try", "rephrasing", "your", "prompt")),
+    ("fg_read_more",        "filtro_gemini", ("read", "more", "about", "our", "policies", "here")),
+    # ── colas comunes (links del markdown, partidos por el tokenizador) ──
+    ("comun_feedback",      "indeterminada", ("send", "feedback", "https")),
+    ("comun_our_policies",  "indeterminada", ("our", "policies", "here", "https")),
+    ("comun_troubleshoot",  "indeterminada", ("gemini", "api", "docs", "troubleshooting")),
+    ("comun_policies",      "indeterminada", ("policies", "google", "com", "terms")),
+    ("comun_use_policy",    "indeterminada", ("terms", "generative", "ai", "use", "policy")),
+)
+
+_BLOQUEO_FILTRO_RX_CACHE: list = []
+
+
+def _bloqueo_filtro_regexes() -> list:
+    """Firmas compiladas: [(slug, variante, regex), …] en orden de catálogo.
+
+    Cada firma es una SECUENCIA DE PALABRAS y entre palabra y palabra se acepta
+    un tramo de hasta 16 caracteres que no sean letra ni dígito (espacios,
+    saltos, puntuación, markdown de link). Así sobrevive a la tokenización del
+    comparador de prensa («send feedback ] ( https : / / ai»). Ninguna firma es
+    una palabra suelta genérica: «could not be submitted» a secas NO es firma
+    (en The British Packet sería prosa legítima).
+    """
+    if _BLOQUEO_FILTRO_RX_CACHE:
+        return _BLOQUEO_FILTRO_RX_CACHE
+    sep = "[\\W_]{0,16}"
+    for slug, variante, palabras in _BLOQUEO_FILTRO_FIRMAS:
+        rx = re.compile(sep.join(re.escape(p) for p in palabras), re.IGNORECASE)
+        _BLOQUEO_FILTRO_RX_CACHE.append((slug, variante, rx))
+    return _BLOQUEO_FILTRO_RX_CACHE
+
+
+def detectar_bloqueo_filtro(texto: str):
+    """¿El texto trae el mensaje de bloqueo de Gemini (o un pedazo reconocible)?
+
+    Función pura. Espejo de `qaDetectarBloqueoFiltro()` de prensa.
+
+    Devuelve None si no hay ninguna firma; si hay, la posición de la firma que
+    empieza ANTES (el mensaje corre hasta el final del texto, así que lo que
+    sigue a esa posición es mensaje).
+
+      {'variante', 'offset', 'firma', 'firmas', 'fragmento'}
+      variante  'prompt_no_enviado' | 'filtro_gemini' | 'indeterminada'
+      offset    índice donde empieza el mensaje, SIN retroceder
+    """
+    if not texto:
+        return None
+
+    hits = []   # (offset, orden_catalogo, slug, variante, fragmento)
+    for orden, (slug, variante, rx) in enumerate(_bloqueo_filtro_regexes()):
+        m = rx.search(texto)
+        if m is not None:
+            hits.append((m.start(), orden, slug, variante, m.group(0)))
+    if not hits:
+        return None
+
+    # Orden de aparición; a igual offset, el orden del catálogo (estable).
+    hits.sort(key=lambda h: (h[0], h[1]))
+    offset, _orden, slug, _var, fragmento = hits[0]
+
+    variante = "indeterminada"
+    for h in hits:
+        if h[3] != "indeterminada":
+            variante = h[3]
+            break
+
+    return {
+        "variante":  variante,
+        "offset":    offset,
+        "firma":     slug,
+        "firmas":    [h[2] for h in hits],
+        "fragmento": fragmento,
+    }
+
+
+def recortar_bloqueo_filtro(texto: str) -> dict:
+    """El texto SIN el mensaje de bloqueo. Espejo de `qaRecortarBloqueoFiltro()`.
+
+    Se corta en el primer carácter del mensaje y, si el mensaje venía pegado a
+    una palabra («de la reconquistaThe prompt…»), se retrocede hasta el último
+    límite de palabra — el token cortado es sospechoso (el modelo se interrumpió
+    a mitad de palabra: «poderosThis request…»). Después se sacan los blancos
+    finales, con la charlist de `rtrim()` de PHP.
+
+    Sin mensaje devuelve el texto IDÉNTICO (ni un byte distinto) y corte None.
+    Invariante con mensaje: `texto == entrada[:corte]`.
+
+      {'texto', 'recortado', 'corte': Optional[int], 'deteccion': Optional[dict]}
+    """
+    det = detectar_bloqueo_filtro(texto)
+    if det is None:
+        return {"texto": texto, "recortado": False, "corte": None, "deteccion": None}
+
+    corte = det["offset"]
+    previo = texto[:corte]
+
+    # Pegado: la última letra/dígito del texto leído toca la primera del mensaje.
+    m = re.search("[^\\W_]+$", previo)
+    if m is not None:
+        corte -= len(m.group(0))
+
+    corte = len(texto[:corte].rstrip(_BLOQUEO_RTRIM_PHP))
+
+    return {
+        "texto":     texto[:corte],
+        "recortado": True,
+        "corte":     corte,
+        "deteccion": det,
+    }
+
+
+# ============================================================
 # DECISIÓN DE VEREDICTO Y SHAPE DE SALIDA
 # ============================================================
 
@@ -4823,6 +5003,45 @@ def shape_salida(
             f"agy probablemente exploró con run_command en vez de transcribir"
         )
 
+    # ── BLOQUEO POR EL FILTRO DE GEMINI (core v48) ────────────────────────────
+    # Gemini pegó su mensaje de rechazo al final del texto generado. Se corta en
+    # ORIGEN: a `transcripciones.texto` va el recortado y el crudo entero sigue
+    # en el bundle forense (`partial_from_ini.txt` / `extracted_db.txt` /
+    # `history_text.txt`, que salen de `res` y NO se tocan acá) y en
+    # `metrics.json`. Se reporta con la parte `bloqueo_filtro` de
+    # `rescate_motivo`, mismo contrato que `parcial_sin_fin`: el worker de prensa
+    # la mapea a SU bit de QA (`QA_BIT_BLOQUEO_FILTRO`) y no a `texto_rescatado`
+    # genérico, porque la política de cola cuenta los bloqueos por motivo.
+    #
+    # VA AL FINAL, después de TODAS las firmas de error, a propósito: ninguna
+    # decisión de veredicto (`longitud_sospechosa`, `D_exploracion_conversacional`,
+    # firmas A-E) puede cambiar por el recorte. Acá sólo se toca el texto que se
+    # va a persistir.
+    #
+    # Sólo con `ok`: en la rama de fallo el `response` va a `api_calls.api_rawresponse`
+    # (forense, nunca a `entradas`) y ahí el crudo vale más que el recorte.
+    #
+    # CASO DEGENERADO — el response es SÓLO el mensaje: no se recorta. Un
+    # `response` vacío con `ok=true` rompe el invariante del veredicto ("OK ⇒
+    # response no vacío") y `parseAndInsertEntradas` recibiría texto vacío. Se
+    # deja el crudo y se marca igual `bloqueo_filtro`: prensa lo detecta del
+    # texto (el detector QA es derivable) y el clasificador de control lo saca
+    # como `sin_texto_util`. Es exactamente el comportamiento pre-F4.
+    bloqueo_variante = ""
+    bloqueo_firma    = ""
+    bloqueo_chars    = 0
+    if ok:
+        _rec_bf = recortar_bloqueo_filtro(response)
+        if _rec_bf["recortado"]:
+            _det_bf          = _rec_bf["deteccion"] or {}
+            bloqueo_variante = str(_det_bf.get("variante") or "")
+            bloqueo_firma    = str(_det_bf.get("firma") or "")
+            if _rec_bf["texto"].strip():
+                bloqueo_chars = len(response) - len(_rec_bf["texto"])
+                response      = _rec_bf["texto"]
+            _prev_bf = str(getattr(res, "rescate_motivo", "") or "")
+            res.rescate_motivo = (_prev_bf + "+bloqueo_filtro") if _prev_bf else "bloqueo_filtro"
+
     stdout_raw_full = res.console_raw or ""
     stdout_largo_sospechoso = len(stdout_raw_full) > UMBRAL_STDOUT_SOSPECHOSO
     stdout_capado = stdout_raw_full
@@ -4968,10 +5187,27 @@ def shape_salida(
         #     sólo en la .db de la conversación.
         #   excepcion_fase        → una fase posterior al spawn tiró excepción.
         #   parcial_sin_fin       → el texto vino truncado (INICIO sin FIN).
+        #   bloqueo_filtro        → (v48) Gemini pegó su mensaje de rechazo al
+        #     final del texto y el `response` va RECORTADO antes de él. Esta
+        #     parte NO va al QA `texto_rescatado` genérico: prensa la mapea a su
+        #     propio bit `bloqueo_filtro` (la política de cola cuenta los
+        #     bloqueos por motivo). Si es la única parte, `texto_rescatado` no se
+        #     prende.
         # prensa lo convierte en el QA grave `texto_rescatado` ⇒ la página cae en
         # revisión humana en vez de mezclarse con las transcripciones sanas, y el
         # bundle forense se archiva en vez de borrarse.
         "rescate_motivo": str(getattr(res, "rescate_motivo", "") or ""),
+        # ── BLOQUEO POR EL FILTRO DE GEMINI (v48) — forense del recorte ────────
+        # Viajan SIEMPRE con default (""/0) para no romper consumidores viejos.
+        #   bloqueo_filtro_variante → 'prompt_no_enviado' | 'filtro_gemini' |
+        #     'indeterminada' (sólo matchearon las colas comunes del markdown).
+        #   bloqueo_filtro_firma    → slug de la firma que empezó ANTES.
+        #   bloqueo_filtro_chars    → chars que se le sacaron al `response`
+        #     (mensaje + palabra pegada + blancos). 0 con la variante poblada =
+        #     caso degenerado: el response era SÓLO el mensaje y NO se recortó.
+        "bloqueo_filtro_variante": bloqueo_variante,
+        "bloqueo_filtro_firma":    bloqueo_firma,
+        "bloqueo_filtro_chars":    int(bloqueo_chars),
         # Forense de la .db (v37). `db_identidad_ok` tri-estado: True = la .db es
         # de ESTA corrida (cascade_id == uuid del logfile); False = es de otra
         # conversación; None = no verificable. Con != True no se persiste texto
@@ -5651,6 +5887,14 @@ def main() -> int:
                 "repeticiones":   out["loop_repeticiones"],
                 "chars":          out["loop_chars"],
                 "chars_response": out["loop_chars_response"],
+            },
+            # v48: recorte del mensaje de bloqueo del filtro de Gemini. `chars`
+            # es lo que se le sacó al `response` persistido; el crudo entero está
+            # en los .txt de este mismo bundle.
+            "bloqueo_filtro": {
+                "variante": out["bloqueo_filtro_variante"],
+                "firma":    out["bloqueo_filtro_firma"],
+                "chars":    out["bloqueo_filtro_chars"],
             },
             "len_response": len(out["response"] or ""),
             "len_extracted_screen": len(res.extracted_screen or ""),

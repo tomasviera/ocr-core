@@ -1307,6 +1307,19 @@ function _agyShapeRespuesta(
     //     (`parcial_sin_fin`, `thinking_mezclado`). Se combinan con `+`.
     //     El worker lo convierte en el QA grave `texto_rescatado` ⇒ la página va
     //     a revisión y el bundle forense se archiva en vez de borrarse.
+    //     v48 (proyecto `bloqueo_filtro_gemini`, F4) suma la parte
+    //     `bloqueo_filtro`: Gemini pegó su mensaje de rechazo al final del texto
+    //     y el `.py` lo cortó en ORIGEN (el crudo entero sigue en el bundle).
+    //     Esa parte NO va al `texto_rescatado` genérico: el worker de prensa la
+    //     mapea a su propio bit `bloqueo_filtro`, porque la política de cola
+    //     cuenta los bloqueos por motivo. Si es la única parte, `texto_rescatado`
+    //     no se prende. Detalle del recorte y del catálogo de firmas (dos copias,
+    //     una por repo, con contrato de equivalencia byte a byte): ver el bloque
+    //     §"BLOQUEO POR EL FILTRO DE GEMINI" de `transcribir_agy.py`.
+    //   bloqueo_filtro_variante / _firma / _chars: forense del recorte. `_chars`
+    //     es lo que se le sacó al `response`; 0 con la variante poblada = el
+    //     response era SÓLO el mensaje y NO se recortó (caso degenerado: vaciar
+    //     el response rompería el invariante "OK ⇒ response no vacío").
     //   db_identidad_ok tri-estado: ¿la .db de conversación era de ESTA corrida?
     //     (cascade_id == uuid del `--log-file`). Con != true el `.py` no
     //     persiste texto NI propaga imagen_cargada/websearch/citations: viajan
@@ -1320,6 +1333,10 @@ function _agyShapeRespuesta(
         : null;
     $extras['db_rechazo']       = isset($data['db_rechazo']) ? (string) $data['db_rechazo'] : '';
     $extras['db_marcas_pagina'] = isset($data['db_marcas_pagina']) ? (int) $data['db_marcas_pagina'] : 0;
+    // Core viejo (v≤47) no manda estas claves → ''/0 → no-op para el worker.
+    $extras['bloqueo_filtro_variante'] = isset($data['bloqueo_filtro_variante']) ? (string) $data['bloqueo_filtro_variante'] : '';
+    $extras['bloqueo_filtro_firma']    = isset($data['bloqueo_filtro_firma'])    ? (string) $data['bloqueo_filtro_firma']    : '';
+    $extras['bloqueo_filtro_chars']    = isset($data['bloqueo_filtro_chars'])    ? (int)    $data['bloqueo_filtro_chars']    : 0;
 
     // Token usage del statusLine side-channel (leído por el .py tras cerrar agy).
     // Si el setup manual del statusLine no se hizo, todos quedan en 0. A
