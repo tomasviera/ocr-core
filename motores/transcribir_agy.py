@@ -4600,6 +4600,38 @@ def decidir_veredicto(res: CaptureResult) -> tuple:
     return ("ERROR", "", "; ".join(err_parts), False, "vacio")
 
 
+# ── Firma de RED CAÍDA (bump v49, 2026-09-21) ─────────────────────────────────
+# Sin DNS/red, agy devuelve una línea corta de error del transporte —
+# "There was a network issue connecting to the server", "Eligibility check
+# failed: Post … dial tcp: lookup …: no such host"— que hasta v48 caía en
+# `exploracion_agy` (ERROR terminal, diagnóstico falso: "el modelo exploró").
+# Caso real (prensa, sesión de control #561): 28 jobs muertos así en 10 min.
+# Son fallos del transporte ANTES de generar ⇒ reintentables. Se mira sólo el
+# arranque del response (600 chars) y `shape_salida` sólo la consulta cuando el
+# response ya es sospechoso (history, sin FIN, corto): una transcripción real
+# nunca llega acá aunque hable de "hosts".
+# El "Authentication required" que agy emite cuando NO PUEDE renovar el token
+# por falta de red no se distingue por el texto de una expiración real: eso lo
+# resuelve el consumidor probando la red (prensa: includes/lib_red_motor.php).
+_FIRMAS_RED = (
+    "no such host",
+    "dial tcp",
+    "network issue connecting",
+    "network is unreachable",
+    "connection refused",
+    "connectex:",
+    "i/o timeout",
+    "tls handshake timeout",
+    "temporary failure in name resolution",
+)
+
+
+def es_firma_red(resp_stripped: str) -> bool:
+    """¿El response corto de agy es un error de transporte (red/DNS)? Pura."""
+    cabeza = (resp_stripped or "")[:600].lower()
+    return any(f in cabeza for f in _FIRMAS_RED)
+
+
 def shape_salida(
     res: CaptureResult,
     args,
@@ -4934,6 +4966,23 @@ def shape_salida(
                 "habituales: 'neither PlanModel nor RequestedModel', UNAUTHENTICATED "
                 "(401), 'model unreachable' (red), HTTP 502. Reintentable." + _sub_txt
             )
+    elif (ok and fuente_response == "history" and not fin_presente
+          and longitud_sospechosa and es_firma_red(resp_stripped)):
+        # R. red caída (bump v49). Mismo gate triple que `exploracion_agy` (D):
+        #    sólo un response corto sin marcadores puede ser un error de
+        #    transporte. Va ANTES de E porque un "Eligibility check failed" por
+        #    DNS no trae RESOURCE_EXHAUSTED y E lo dejaba caer a D. Ver
+        #    `_FIRMAS_RED` arriba.
+        firma_detectada = "R_red_caida"
+        ok = False
+        veredicto = "TRANSITORIO"
+        firma_transitorio_motivo_forzado = "red_sin_conexion"
+        error = (
+            "red_sin_conexion: agy no pudo hablar con el backend (DNS/TCP: "
+            + resp_stripped[:160].replace("\n", " ")
+            + "). Falla de transporte antes de generar: reintentable. NO es "
+            "exploración del modelo ni un problema de la página"
+        )
     elif ok and ("eligibility check failed" in resp_stripped[:200].lower()
                  and "resource_exhausted" in resp_stripped.lower()):
         # E. eligibility check 429 (bump v29). agy muere en el chequeo de
