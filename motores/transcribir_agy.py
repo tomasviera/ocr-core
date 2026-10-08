@@ -1866,7 +1866,15 @@ def _png_en_gen_metadata(db_path: Optional[str]) -> Optional[bool]:
                 continue
             if isinstance(d, str):
                 d = d.encode("utf-8", "replace")
-            if b"\x89PNG" in bytes(d):
+            b = bytes(d)
+            if b"\x89PNG" in b:
+                return True
+            # v50: también JPEG. agy manda la imagen en su formato original: las fotos de
+            # manuscritos (JPEG, unificacion_manuscritos 2026-10-08, job 144192 del clon:
+            # blob JPEG de 2,4 MB) daban False → falso positivo grave NO_CARGO_IMAGEN.
+            # SOI `FF D8 FF` + piso de 4 KiB para que 3 bytes sueltos en un blob chico de
+            # metadata no cuenten como imagen.
+            if len(b) >= 4096 and b"\xff\xd8\xff" in b:
                 return True
         return False
     except Exception as e:
