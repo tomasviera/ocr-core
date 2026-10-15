@@ -3435,7 +3435,19 @@ _URL_RE = re.compile(r"https?://([A-Za-z0-9.\-]+)", re.IGNORECASE)
 _URL_GOOGLE_HOSTS_SUFFIX = (
     "google.com", "googleusercontent.com", "gstatic.com", "googleapis.com",
     "youtube.com", "ggpht.com", "chromium.org",
+    # v51: `ai.google.dev` es el link «send feedback» del mensaje del filtro de
+    # recitación que el backend deja en la .db; prendía WEBSEARCH sin búsqueda
+    # (43/43 bundles del 12–15/10 con ese host traían el mensaje, 0/96 sin él).
+    "google.dev",
 )
+# ── Bloqueo de salida por el filtro de RECITACIÓN (bump v51, 2026-10-15) ─────
+# Con 3.8 Flash el backend corta la respuesta y deja en la .db «The generated
+# content was filtered because it may contain material that resembles existing
+# copyrighted works…». A diferencia de v48 el mensaje NO se pega al texto: el
+# agente sigue y escribe un resumen de la página en vez de la transcripción.
+# Sin `citationMetadata`, así que `citation_urls` no lo ve.
+_RECITACION_BLOQUEO_RE = re.compile(
+    r"resembles\W{1,4}existing\W{1,4}copyrighted\W{1,4}works", re.IGNORECASE)
 # ── Citations del checker de atribución/recitación (bump v30, 2026-07-24) ────
 # Cuando el texto generado matchea material indexado, el backend adjunta al
 # candidato un `CitationMetadata` con N × `CitationSource`:
@@ -3597,7 +3609,8 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
     imagen_cargada=None.
     """
     out = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": [],
-           "citation_urls": [], "imagen_cargada": None,
+           "citation_urls": [], "recitacion_bloqueada": False,
+           "imagen_cargada": None,
            "imagen_tripleta": False, "imagen_png_media": None,
            "db_via": "", "db_identidad_ok": None}
 
@@ -3669,6 +3682,9 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
                 citation_hosts.add(_m.group(1).lower())
     except Exception:
         out["citation_urls"] = []
+    # v51: mensaje del filtro de recitación en algún step (ver `_RECITACION_BLOQUEO_RE`).
+    out["recitacion_bloqueada"] = any(
+        _RECITACION_BLOQUEO_RE.search(b) for _i, b in steps_strings)
 
     seen_signals = set()
     seen_hosts = set()
@@ -5198,6 +5214,10 @@ def shape_salida(
         #             recitación enmascarada. **NO es evidencia de acceso web.**
         # Ver notas/bloqueo_qa_recurrente.md §"Evidencia forense".
         "citation_urls": list(getattr(res, "citation_urls", None) or []),
+        # v51: el backend bloqueó la salida por recitación (mensaje en la .db,
+        # sin citations). True ⇒ lo que haya en `response` no es la página
+        # entera; suele ser un fragmento + un resumen escrito por el agente.
+        "recitacion_bloqueada": bool(getattr(res, "recitacion_bloqueada", False)),
         # LOOP degenerado de salida (bump v31, 2026-07-31). agy quedó repitiendo
         # una unidad corta después de terminar de generar (ver §"Bump v31").
         #   loop_detectado=False → camino normal, el resto de las claves en 0/"".
@@ -5854,6 +5874,7 @@ def main() -> int:
             )
     # v30: citations del checker de atribución/recitación → shape → PHP.
     res.citation_urls = _db_info.get("citation_urls") or []
+    res.recitacion_bloqueada = bool(_db_info.get("recitacion_bloqueada"))
 
     # ── tools_used: en `-p` viene de la .db; en `-i` del chrome del TUI ──
     # El chrome del TUI aparece en `history_text` sólo en `-i` (agy interactivo).
@@ -5922,6 +5943,7 @@ def main() -> int:
                 # v30: evidencia de recitación enmascarada (NO de web). Ver
                 # `_CITATION_URI_RE` y `notas/bloqueo_qa_recurrente.md`.
                 "citation_urls": _db_info.get("citation_urls") or [],
+                "recitacion_bloqueada": bool(_db_info.get("recitacion_bloqueada")),
                 # v34: las 3 señales POR SEPARADO + la resuelta. Sin esto, un
                 # falso positivo/negativo de `imagen_cargada` no se puede
                 # diagnosticar desde el bundle sin reabrir la .db.

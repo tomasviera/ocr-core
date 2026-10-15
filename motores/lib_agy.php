@@ -1258,6 +1258,9 @@ function _agyShapeRespuesta(
     $extras['citation_urls'] = (array_key_exists('citation_urls', $data) && is_array($data['citation_urls']))
         ? array_values(array_filter(array_map('strval', $data['citation_urls'])))
         : [];
+    // Bump v51: el backend bloqueó la salida por recitación (mensaje en la .db,
+    // sin citations). Core viejo (v≤50) no manda la clave → false → no-op.
+    $extras['recitacion_bloqueada'] = !empty($data['recitacion_bloqueada']);
     // LOOP degenerado de salida (bump v31, 2026-07-31). El `.py` cortó la
     // captura porque agy quedó repitiendo una unidad corta (`producing`) DESPUÉS
     // de terminar de generar — bug del CLI, no del modelo. Semántica:
