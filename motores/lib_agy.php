@@ -1226,6 +1226,10 @@ function _agyShapeRespuesta(
     $extras['weekly_reset_seg'] = isset($data['quota_weekly_reset_seg']) ? (int)$data['quota_weekly_reset_seg'] : null;
     $extras['h5_pct_usado']     = isset($data['quota_h5_pct_usado'])     ? (float)$data['quota_h5_pct_usado'] : null;
     $extras['h5_reset_seg']     = isset($data['quota_h5_reset_seg'])     ? (int)$data['quota_h5_reset_seg'] : null;
+    // Cuota propia de Gemini 4 Argon (v52): % REMANENTE, no usado (misma escala
+    // que el /usage). null cuando el statusLine no la trajo.
+    $extras['argon_rem_pct']    = isset($data['quota_argon_rem_pct'])    ? (float)$data['quota_argon_rem_pct'] : null;
+    $extras['argon_reset_seg']  = isset($data['quota_argon_reset_seg'])  ? (int)$data['quota_argon_reset_seg'] : null;
     $extras['account_email']    = $data['account_email'] ?? null;
     // Segundos hasta el reset de cuota (parseado del 429 "Resets in 13m27s" en
     // la .db de la conversación). 0 si no se pudo parsear → el worker usará el

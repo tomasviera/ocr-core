@@ -3998,6 +3998,11 @@ def _leer_token_usage_raw(sandbox_dir: Path, silencioso: bool = False) -> dict:
         # consumidor PHP gatea con !== null y NO toca cuota. 0.0 sería "0% usado".
         "quota_weekly_pct_usado": None, "quota_weekly_reset_seg": None,
         "quota_h5_pct_usado": None, "quota_h5_reset_seg": None,
+        # Cuota semanal propia de Gemini 4 Argon (clave `gemini-argon-*weekly*`,
+        # hoy `gemini-argon-wtu-weekly`). Es REMANENTE (%), no usado: es la
+        # misma escala que el /usage («Gemini 4 Argon Weekly Limit … X %») y que
+        # `agy_bucket_estado_argon_<cuenta>`. None = no vino (v52).
+        "quota_argon_rem_pct": None, "quota_argon_reset_seg": None,
         "account_email": None,
     }
     path = sandbox_dir / ".agy_last_status.json"
@@ -4066,6 +4071,23 @@ def _leer_token_usage_raw(sandbox_dir: Path, silencioso: bool = False) -> dict:
         out["quota_h5_pct_usado"] = _pct_usado(g5.get("remaining_fraction"))
     if "reset_in_seconds" in g5:
         out["quota_h5_reset_seg"] = _i(g5.get("reset_in_seconds"))
+    # Argon (v52): el statusLine trae su weekly en cada corrida, así el visor y
+    # el freno del bucket no dependen de un /usage (2026-10-17: el reset de
+    # Argon pasó inadvertido horas). Se busca por prefijo por si Google cambia
+    # el sufijo (`-wtu-`); con dos claves posibles gana la primera en orden.
+    ga = {}
+    if isinstance(q, dict):
+        for k in sorted(q):
+            if str(k).startswith("gemini-argon") and "weekly" in str(k) and isinstance(q[k], dict):
+                ga = q[k]
+                break
+    if "remaining_fraction" in ga:
+        try:
+            out["quota_argon_rem_pct"] = round(float(ga.get("remaining_fraction")) * 100.0, 2)
+        except Exception:
+            out["quota_argon_rem_pct"] = None
+    if "reset_in_seconds" in ga:
+        out["quota_argon_reset_seg"] = _i(ga.get("reset_in_seconds"))
     out["account_email"] = str(data.get("email") or "") or None
     return out
 
@@ -5189,6 +5211,8 @@ def shape_salida(
         "quota_weekly_reset_seg": tokens.get("quota_weekly_reset_seg"),
         "quota_h5_pct_usado":     tokens.get("quota_h5_pct_usado"),
         "quota_h5_reset_seg":     tokens.get("quota_h5_reset_seg"),
+        "quota_argon_rem_pct":    tokens.get("quota_argon_rem_pct"),
+        "quota_argon_reset_seg":  tokens.get("quota_argon_reset_seg"),
         "account_email":          tokens.get("account_email"),
         # Chequeo fáctico "agy adjuntó imagen.jpg al contexto multimodal"
         # (bump v28, 2026-07-23). Firma unívoca en `steps` de la .db de
