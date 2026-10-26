@@ -3970,6 +3970,108 @@ def leer_token_usage(sandbox_dir: Path, _muestreo: bool = False) -> dict:
     return out if _muestreo else _fusionar_token_usage_hw(out)
 
 
+# ── Tokens desde la .db de conversación (v53) ───────────────────────────────
+# agy 1.4.7 (2026-10-23 23:51) dejó de correr el statusLine en `-p` → tokens en 0
+# en todas las corridas. La .db guarda una fila de `gen_metadata` por request al
+# modelo; cada blob es protobuf y trae el uso en `1.4`: `.2` input, `.3` output
+# TOTAL (thought + respuesta), `.5` cached, `.9` thought, `.10` respuesta
+# (`.3 = .9 + .10` exacto en todos los casos medidos; campo ausente = 0).
+# Calibrado contra bundles con statusLine vivo (job158661: 9508/35, job158448:
+# 6931/70, job110373: cached 12159 = statusLine) y contra el largo del texto
+# (763 chars → 201, 2770 → 699 en Flash low, sin thought). El statusLine
+# reportaba UN request y metía el thought en output; acá se suma la corrida
+# entera (cada request re-envía el contexto, eso es lo consumido) y se sigue la
+# convención del HTTP de Gemini (`lib_http_caller.php`: output = candidates, sin
+# thought; thought aparte). Sin esquema oficial: si el formato cambia, devuelve
+# None y queda lo del statusLine (degradación limpia).
+def _pb_varint(b: bytes, i: int) -> tuple:
+    r = s = 0
+    while True:
+        c = b[i]
+        i += 1
+        r |= (c & 0x7F) << s
+        s += 7
+        if c < 0x80:
+            return r, i
+
+
+def _pb_campos(b: bytes) -> Optional[dict]:
+    """Un nivel de protobuf: {campo: [valor, ...]}; varint → int, len → bytes.
+    None si los bytes no son un mensaje válido."""
+    out: dict = {}
+    i = 0
+    try:
+        while i < len(b):
+            k, i = _pb_varint(b, i)
+            f, w = k >> 3, k & 7
+            if f == 0:
+                return None
+            if w == 0:
+                v, i = _pb_varint(b, i)
+            elif w == 1:
+                v, i = None, i + 8
+            elif w == 5:
+                v, i = None, i + 4
+            elif w == 2:
+                n, i = _pb_varint(b, i)
+                v, i = b[i:i + n], i + n
+            else:
+                return None
+            if i > len(b):
+                return None
+            out.setdefault(f, []).append(v)
+        return out
+    except IndexError:
+        return None
+
+
+def leer_tokens_gen_metadata(db_path: Optional[str]) -> Optional[dict]:
+    """Suma el uso de las filas de `gen_metadata`. None si no hay .db, no hay
+    filas con uso, o no se pudo leer."""
+    if not db_path:
+        return None
+    try:
+        uri = "file:" + str(db_path).replace("\\", "/") + "?mode=ro"
+        con = sqlite3.connect(uri, uri=True, timeout=2)
+    except Exception as e:
+        sys.stderr.write(f"[agy] WARN leer_tokens_gen_metadata (open): {e}\n")
+        return None
+    tin = tout = tth = tca = n = 0
+    try:
+        for (d,) in con.execute("SELECT data FROM gen_metadata ORDER BY idx"):
+            if not isinstance(d, (bytes, bytearray, memoryview)):
+                continue
+            top = _pb_campos(bytes(d))
+            if not top or not isinstance((top.get(1) or [None])[0], bytes):
+                continue
+            m1 = _pb_campos(top[1][0])
+            if not m1 or not isinstance((m1.get(4) or [None])[0], bytes):
+                continue
+            uso = _pb_campos(m1[4][0])
+            if not uso:
+                continue
+            v = {c: uso.get(c, [0])[0] for c in (2, 3, 5, 9)}
+            if not all(isinstance(x, int) for x in v.values()) or (v[2] + v[3]) <= 0:
+                continue
+            tin += v[2]
+            tout += max(v[3] - v[9], 0)
+            tth += v[9]
+            tca += v[5]
+            n += 1
+    except Exception as e:
+        sys.stderr.write(f"[agy] WARN leer_tokens_gen_metadata: {e}\n")
+        return None
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    if n == 0:
+        return None
+    return {"tokens_input": tin, "tokens_output": tout, "tokens_thought": tth,
+            "tokens_cached": tca, "tokens_total": tin + tout + tth, "requests": n}
+
+
 def _leer_token_usage_raw(sandbox_dir: Path, silencioso: bool = False) -> dict:
     """Lee `<sandbox>/.agy_last_status.json` y mapea token counters.
 
@@ -5924,6 +6026,17 @@ def main() -> int:
     # ── Token usage real via statusLine side-channel (plan #3 §5) ──
     # Degrada limpio a tokens_*=0 si el setup manual del statusLine no está hecho.
     tokens = leer_token_usage(sandbox_dir)
+    # v53: la .db manda sobre el statusLine (muerto en `-p` desde agy 1.4.7).
+    # Sólo si la .db es de ESTA corrida: con identidad rechazada serían tokens ajenos.
+    _tok_db = (leer_tokens_gen_metadata(_db_info.get("db_path"))
+               if _db_info.get("db_identidad_ok") is not False else None)
+    if _tok_db:
+        tokens.update({k: _tok_db[k] for k in ("tokens_input", "tokens_output", "tokens_thought",
+                                               "tokens_cached", "tokens_total")})
+        sys.stderr.write(
+            f"[agy] tokens_db: in={_tok_db['tokens_input']} out={_tok_db['tokens_output']} "
+            f"thought={_tok_db['tokens_thought']} cached={_tok_db['tokens_cached']} "
+            f"requests={_tok_db['requests']}\n")
 
     # ── Compose salida + escribir JSON ──
     out = shape_salida(
