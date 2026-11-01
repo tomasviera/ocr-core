@@ -1851,16 +1851,39 @@ def _png_en_gen_metadata(db_path: Optional[str]) -> Optional[bool]:
 
     Se itera fila por fila (los blobs pueden ser de 3 MB): nada de `fetchall()`.
     """
+    return _imagen_en_blobs_db(db_path, "SELECT data FROM gen_metadata",
+                               "_png_en_gen_metadata")
+
+
+def _imagen_en_steps(db_path: Optional[str]) -> Optional[bool]:
+    """¿Hay un PNG/JPEG crudo en algún `step_payload` de `steps` (v54)?
+
+    Cuando el prompt menciona la imagen con `@imagen.jpg` (sin tool call), agy
+    la adjunta INLINE al mensaje del usuario: los bytes quedan en el step del
+    input y NO en `gen_metadata`. Medido sobre `temp/agy_debug/` de prensa
+    (1.432 bundles, 2026-11-01): 3 transcripciones de 3.8 Flash (Low), LS
+    1.4.2/1.4.3 (jobs 154455, 155643, 155845), completas contra la imagen,
+    daban False por mirar sólo `gen_metadata`. Mismo criterio de bytes que
+    `_png_en_gen_metadata` (los bytes son el binario, no el rastro del intento).
+    """
+    return _imagen_en_blobs_db(db_path, "SELECT step_payload FROM steps",
+                               "_imagen_en_steps")
+
+
+def _imagen_en_blobs_db(db_path: Optional[str], sql: str,
+                        etiqueta: str) -> Optional[bool]:
+    """True si algún blob de la consulta trae PNG/JPEG crudo, False si ninguno,
+    None si la .db / la tabla no se puede leer."""
     if not db_path:
         return None
     try:
         uri = "file:" + str(db_path).replace("\\", "/") + "?mode=ro"
         con = sqlite3.connect(uri, uri=True, timeout=2)
     except Exception as e:
-        sys.stderr.write(f"[agy] WARN _png_en_gen_metadata (open): {e}\n")
+        sys.stderr.write(f"[agy] WARN {etiqueta} (open): {e}\n")
         return None
     try:
-        cur = con.execute("SELECT data FROM gen_metadata")
+        cur = con.execute(sql)
         for (d,) in cur:
             if d is None:
                 continue
@@ -1879,7 +1902,7 @@ def _png_en_gen_metadata(db_path: Optional[str]) -> Optional[bool]:
         return False
     except Exception as e:
         # Tabla ausente (formato viejo de .db) o lectura fallida → no verificable.
-        sys.stderr.write(f"[agy] WARN _png_en_gen_metadata: {e}\n")
+        sys.stderr.write(f"[agy] WARN {etiqueta}: {e}\n")
         return None
     finally:
         try:
@@ -1905,9 +1928,28 @@ def _media_en_log(agy_log_path) -> Optional[int]:
     return max(vals) if vals else None
 
 
+def _media_sin_inline_en_log(agy_log_path) -> Optional[bool]:
+    """¿El `--log-file` trae `media has no inline data` (v54)?
+
+    Es la firma del #735 (LS 1.1.10): el converter arma el request con la
+    imagen VACÍA y el backend contesta INVALID_ARGUMENT 400. Única evidencia
+    positiva de "el view_file corrió pero la imagen no viajó". None si el log
+    no existe o no es legible.
+    """
+    try:
+        if not agy_log_path or not Path(agy_log_path).is_file():
+            return None
+        txt = Path(agy_log_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    return "media has no inline data" in txt.lower()
+
+
 def _resolver_imagen_cargada(png_gen_metadata: Optional[bool],
                              tripleta_steps: bool,
-                             media_en_log: Optional[int]) -> Optional[bool]:
+                             media_en_log: Optional[int],
+                             imagen_steps: Optional[bool] = None,
+                             media_sin_inline: Optional[bool] = None) -> Optional[bool]:
     """Señal tri-estado "agy adjuntó la imagen al contexto multimodal" (v34).
 
     Reemplaza la señal de v28 (la tripleta `imagen.jpg`+`image/`+
@@ -1931,15 +1973,35 @@ def _resolver_imagen_cargada(png_gen_metadata: Optional[bool],
                       evidencia disponible y vale más que un None.
     Nota: la señal del PNG habría detectado el #735 el primer día (el `-p` roto
     da 0 PNG en `gen_metadata` mientras la tripleta decía que todo bien).
+
+    v54 — "sin PNG en `gen_metadata`" dejó de ser prueba de que la imagen no
+    viajó (falso positivo grave NO_CARGO_IMAGEN sobre transcripciones completas,
+    proyecto `liberar_revisar` de prensa, 2026-11-01). Dos vías, medidas sobre
+    1.432 bundles de `temp/agy_debug/` y verificadas página por página contra la
+    imagen:
+      - `@imagen.jpg` sin tool call (3.8 Flash Low, LS 1.4.x): los bytes van
+        INLINE en el step del input, no en `gen_metadata` → `imagen_steps`.
+      - `view_file` con LS ≥ 1.3: el tool result referencia el archivo de
+        `.tempmediaStorage` con `inline_data` vacío y la `.db` leída al cierre
+        trae `gen_metadata` SIN las filas posteriores a la imagen (p. ej. job
+        146519: 1 fila, 11.839 tokens de input, transcripción exacta). Ahí la
+        `.db` no puede decir si la imagen viajó → None (no verificable), salvo
+        la firma positiva del #735 en el log (`media_sin_inline`) → False.
+    False queda para: firma del #735, o una `.db` legible sin bytes de imagen
+    en ningún lado y sin intento de abrirla (el modelo nunca la pidió).
     """
     if (media_en_log or 0) >= 1:
         return True
-    if png_gen_metadata is True:
+    if png_gen_metadata is True or imagen_steps is True:
         return True
-    if png_gen_metadata is False:
+    if media_sin_inline is True:
         return False
-    # gen_metadata no verificable → última evidencia disponible.
-    return True if tripleta_steps else None
+    if png_gen_metadata is None:
+        # gen_metadata no verificable → última evidencia disponible.
+        return True if tripleta_steps else None
+    if tripleta_steps:
+        return None
+    return False
 
 
 # ============================================================
@@ -3593,6 +3655,7 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
                             el que tiene el path del log.
       - `imagen_tripleta` : bool — señal vieja (v28) cruda, para forense.
       - `imagen_png_media`: bool|None — PNG en `gen_metadata`, cruda.
+      - `imagen_steps_media`: bool|None — PNG/JPEG inline en `steps` (v54), cruda.
       - `db_via`          : "uuid" | "mtime" | "" — cómo se eligió la .db (v37).
       - `db_identidad_ok` : bool|None — ¿la .db es de ESTA corrida? (v37).
 
@@ -3612,6 +3675,7 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
            "citation_urls": [], "recitacion_bloqueada": False,
            "imagen_cargada": None,
            "imagen_tripleta": False, "imagen_png_media": None,
+           "imagen_steps_media": None,
            "db_via": "", "db_identidad_ok": None}
 
     # ── Vía 1 (preferida): UUID exacto del logfile ──
@@ -3755,8 +3819,10 @@ def _parsear_conversacion_db(conv_dir: str, t_launch: float,
     # helper sigue siendo usable/testeable de forma independiente.
     out["imagen_tripleta"]  = imagen_tripleta
     out["imagen_png_media"] = _png_en_gen_metadata(chosen_db)
+    out["imagen_steps_media"] = _imagen_en_steps(chosen_db)
     out["imagen_cargada"]   = _resolver_imagen_cargada(
-        out["imagen_png_media"], imagen_tripleta, None)
+        out["imagen_png_media"], imagen_tripleta, None,
+        out["imagen_steps_media"])
     return out
 
 
@@ -5859,6 +5925,7 @@ def main() -> int:
     _db_info = {"db_path": None, "tool_calls": [], "web_signals": [], "web_urls": [],
                 "citation_urls": [], "imagen_cargada": None,
                 "imagen_tripleta": False, "imagen_png_media": None,
+                "imagen_steps_media": None,
                 "db_via": "", "db_identidad_ok": None}
     # Inicializado FUERA del try: si la lectura del log revienta, `_uuid` tiene
     # que existir igual — lo consume `resolver_texto_db` más abajo (sin esto,
@@ -5895,6 +5962,13 @@ def main() -> int:
     except Exception as _e:
         sys.stderr.write(f"[agy] WARN _media_en_log: {_e}\n")
     res.media_en_log = _media_log
+    # v54: firma positiva del #735 (`media has no inline data`), la única que
+    # todavía permite decir False cuando la `.db` no trae los bytes.
+    _sin_inline = None
+    try:
+        _sin_inline = _media_sin_inline_en_log(agy_log_path)
+    except Exception as _e:
+        sys.stderr.write(f"[agy] WARN _media_sin_inline_en_log: {_e}\n")
 
     # Propagar al `res` para que shape_salida lo lea (mismo patrón que
     # cuota_reset_seg / transitorio_motivo). None = no se pudo leer la DB
@@ -5903,11 +5977,15 @@ def main() -> int:
         _db_info.get("imagen_png_media"),
         bool(_db_info.get("imagen_tripleta")),
         _media_log,
+        _db_info.get("imagen_steps_media"),
+        _sin_inline,
     )
     sys.stderr.write(
         f"[agy] imagen_cargada: png_gen_metadata={_db_info.get('imagen_png_media')} "
         f"tripleta_steps={_db_info.get('imagen_tripleta')} "
-        f"media_en_log={_media_log} → {res.imagen_cargada_ok}\n"
+        f"media_en_log={_media_log} "
+        f"steps_media={_db_info.get('imagen_steps_media')} "
+        f"media_sin_inline={_sin_inline} → {res.imagen_cargada_ok}\n"
     )
 
     # ── MODO `paste`: la transcripción sale de la .db, NO de la pantalla ──────
@@ -6087,6 +6165,7 @@ def main() -> int:
                 "imagen_cargada": out["imagen_cargada_ok"],
                 "imagen_tripleta_steps": bool(_db_info.get("imagen_tripleta")),
                 "imagen_png_gen_metadata": _db_info.get("imagen_png_media"),
+                "imagen_steps_media": _db_info.get("imagen_steps_media"),
                 "imagen_media_en_log": out["media_en_log"],
             },
             "tokens": tokens,
