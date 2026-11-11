@@ -2138,6 +2138,23 @@ def _tui_listo(snapshot: str) -> bool:
             and _TUI_LISTO_PROMPT_RE.search(snapshot) is not None)
 
 
+# ── Diálogo de Términos del TUI (agy 1.5.x, v55, 2026-11-11) ──────────────────
+# Desde agy 1.5.5 el TUI arranca, en una cuenta que no los aceptó, con
+# «Terms of Service & Data Use» + una casilla de consentimiento de datos +
+# [Previous] [Done] («↑/↓ Navigate · enter Toggle»). El modo `-p` no lo muestra,
+# así que las transcripciones siguen y sólo cae el /usage. Antes del v55 el
+# READY vencía (no hay corona) y se mandaba "/usage\r" igual: el Enter
+# tildaba/destildaba el consentimiento. Caso: DESKTOP-OQNQE7H (donsarasa2998)
+# 2026-11-10 18:09 → 11-11 ~02:00, 129 checks fallidos con
+# `bloque_gemini_no_encontrado`. Lo resuelve una persona aceptando en el TUI.
+_TUI_TERMINOS_RE = re.compile(r"Terms\s+of\s+Service\s*&\s*Data\s+Use", re.IGNORECASE)
+
+
+def _pide_aceptar_terminos(snapshot: str) -> bool:
+    """True si la pantalla es el diálogo de Términos de agy 1.5.x."""
+    return bool(snapshot) and _TUI_TERMINOS_RE.search(snapshot) is not None
+
+
 def _hay_bloque_gemini(snapshot: str) -> bool:
     """True si la pantalla trae el bloque GEMINI MODELS — el contenido que el
     /usage tiene que haber dejado. Se usa para decidir si vale reintentar."""
@@ -2268,6 +2285,7 @@ def capturar_slash_command(
     respuesta_ok_fn=None,
     max_intentos: int = 3,
     verbose: bool = True,
+    abortar_fn=None,
 ) -> dict:
     """Lanza `argv` bajo ConPTY; espera quiescencia (TUI listo) y manda
     `slash_cmd` + Enter al stdin del PTY; espera quiescencia post-comando;
@@ -2292,6 +2310,11 @@ def capturar_slash_command(
     para la respuesta. Si tras la fase 3 la pantalla no lo satisface y el
     proceso sigue vivo, se REENVÍA el comando (hasta `max_intentos` en
     total). Cubre el caso de un comando comido por un repintado.
+
+    `abortar_fn(snapshot) -> bool` (opcional, v55): si durante el READY la
+    pantalla la satisface, se corta SIN escribir nada (motivo ABORTADO). Para
+    diálogos donde tipear tiene efectos: el de Términos de agy 1.5.x, donde
+    Enter tilda/destilda el consentimiento de datos.
 
     Devuelve dict con: ok, snapshot, history, raw, bytes_total, exitstatus,
     pid, estado, error, duracion_seg, ready_ok (bool), post_ok (bool).
@@ -2359,7 +2382,7 @@ def capturar_slash_command(
     reader.start()
 
     def _drenar(quiescent_seg: float, total_timeout: float, label: str,
-                gate_fn=None) -> tuple:
+                gate_fn=None, abort_fn=None) -> tuple:
         """Drena el queue hasta que pasen N segundos sin bytes ÚTILES (o
         total_timeout). Devuelve (ok, motivo) con motivo ∈ {QUIESCENT, TIMEOUT,
         PROC_EXIT, READER_EXC}.
@@ -2411,6 +2434,12 @@ def capturar_slash_command(
                 pass
             if ((now - last_byte) >= quiescent_seg
                     and (bytes_utiles - utiles_at_entry) > 0):
+                if abort_fn is not None and abort_fn(_screen_text(plain)):
+                    if verbose:
+                        sys.stderr.write(
+                            f"[agy-usage] {label}: ABORTADO t={int(now-local_t0)}s "
+                            f"(la pantalla pide no tipear)\n")
+                    return (False, "ABORTADO")
                 if gate_fn is not None and not gate_fn(_screen_text(plain)):
                     # Quiescencia con la pantalla todavía sin lo que
                     # esperábamos: NO es cierre. Reiniciamos la ventana y
@@ -2439,8 +2468,13 @@ def capturar_slash_command(
     try:
         # FASE 1: esperar TUI listo
         ready_ok, ready_motivo = _drenar(ready_quiescent_seg, ready_timeout_seg, "READY",
-                                         gate_fn=listo_fn)
-        if not ready_ok and ready_motivo in ("PROC_EXIT", "READER_EXC"):
+                                         gate_fn=listo_fn, abort_fn=abortar_fn)
+        if ready_motivo == "ABORTADO":
+            # La pantalla es un diálogo donde tipear tiene efectos (v55):
+            # no se escribe nada; main_usage pone el error con nombre.
+            estado = "ABORTADO"
+            error = "pantalla_no_tipeable"
+        elif not ready_ok and ready_motivo in ("PROC_EXIT", "READER_EXC"):
             # agy murió antes de que pudiéramos mandar el comando: no hay nada
             # que escribir ni que esperar.
             estado = "PROC_EXIT"
@@ -2619,6 +2653,7 @@ def main_usage(args, t0_total: float) -> int:
         respuesta_ok_fn=_hay_bloque_gemini,
         max_intentos=USAGE_MAX_INTENTOS_CMD,
         verbose=True,
+        abortar_fn=_pide_aceptar_terminos,
     )
 
     # Si el subprocess de agy NO cerró solo, agy quedó vivo (TUI esperando otro
@@ -2667,7 +2702,11 @@ def main_usage(args, t0_total: float) -> int:
     # chequeo entero durante 2 días con la pantalla lista y legible).
     veredicto_ok = gemini_ok and weekly_ok
     if not veredicto_ok:
-        if not gemini_ok:
+        if not gemini_ok and _pide_aceptar_terminos(cap.get("snapshot") or ""):
+            error_msg = ("agy_pide_aceptar_terminos: el TUI de agy muestra el diálogo «Terms of Service & "
+                         "Data Use»; alguien tiene que correr `agy` en esa máquina y aceptarlo "
+                         f"(estado={cap.get('estado')})")
+        elif not gemini_ok:
             error_msg = (f"bloque_gemini_no_encontrado en snapshot ({len(cap.get('snapshot') or '')} chars); "
                          f"estado={cap.get('estado')} err={cap.get('error')}; "
                          f"parser_notes={parsed.get('parser_notes')}")
