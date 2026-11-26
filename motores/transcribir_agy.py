@@ -2049,7 +2049,7 @@ USAGE_MAX_INTENTOS_CMD    = 3
 #     Ver notas/motor_agy.md §"Bump v21".
 _USAGE_REMAINING_RE = re.compile(
     r"(?:(?P<rem>\d+)%\s+remaining\s*·\s*)?Refreshes\s+in\s+"
-    r"(?:(?P<h>\d+)h\s*)?(?:(?P<m>\d+)m)?", re.IGNORECASE)
+    r"(?:(?P<d>\d+)d\s*)?(?:(?P<h>\d+)h\s*)?(?:(?P<m>\d+)m)?", re.IGNORECASE)
 _USAGE_BAR_RE = re.compile(
     r"\]\s+(?P<rem>\d+(?:\.\d+)?)\s*%", re.IGNORECASE)
 _USAGE_QUOTA_AVAILABLE_RE = re.compile(r"\bQuota\s+available\b", re.IGNORECASE)
@@ -2189,10 +2189,15 @@ def _parse_usage_segmento(seg_text: str) -> tuple:
     # reset_seg: sólo del header. Si el header no matcheó, dejamos None
     # (el UPSERT PHP lo persiste como weekly_reset_at=NULL).
     reset_seg = None
-    if hdr_m is not None:
+    # Desde 2026-11-25 04:36 el TUI escribe días («Refreshes in 4d 21h 29m»); antes sólo horas
+    # («117h 29m»). Sin el grupo `d` el regex matcheaba vacío y daba reset 0 = «refresca ya»:
+    # cientos de refresh falsos en prensa. Si el header no trae NINGUNA unidad conocida, el reset
+    # queda None (dato desconocido), nunca 0.
+    if hdr_m is not None and any(hdr_m.group(k) for k in ("d", "h", "m")):
+        dias  = int(hdr_m.group("d") or 0)
         horas = int(hdr_m.group("h") or 0)
         mins  = int(hdr_m.group("m") or 0)
-        reset_seg = horas * 3600 + mins * 60
+        reset_seg = dias * 86400 + horas * 3600 + mins * 60
     return (pct_usado, reset_seg)
 
 
